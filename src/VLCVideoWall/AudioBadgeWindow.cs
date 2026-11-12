@@ -92,8 +92,6 @@ public sealed class AudioBadgeWindow : IDisposable
     [DllImport("user32.dll")]
     private static extern bool DestroyWindow(IntPtr hWnd);
 
-    [DllImport("user32.dll")]
-    private static extern bool ShowWindow(IntPtr hWnd, int cmd);
 
     [DllImport("user32.dll")]
     private static extern IntPtr LoadCursor(IntPtr instance, int cursor);
@@ -160,17 +158,18 @@ public sealed class AudioBadgeWindow : IDisposable
                 {
                     PAINTSTRUCT ps;
                     var hdc = BeginPaint(hWnd, out ps);
-                    using (var g = Graphics.FromHdc(hdc))
-                        self.Paint(g);
+                    self.PaintBuffered(hdc);
                     EndPaint(hWnd, ref ps);
                     return IntPtr.Zero;
                 }
             case WM_ERASEBKGND:
                 return (IntPtr)1;
             case WM_LBUTTONDOWN:
+                SetCapture(hWnd);
                 return IntPtr.Zero;      // не отдаём клик окну стены
             case WM_LBUTTONUP:
             case WM_RBUTTONUP:
+                ReleaseCapture();
                 if (self.State == AudioBadgeState.NoTrack || self.State == AudioBadgeState.Busy) return IntPtr.Zero;
                 var handler = self.Clicked;
                 if (handler != null) handler();
@@ -187,40 +186,45 @@ public sealed class AudioBadgeWindow : IDisposable
         Invalidate();
     }
 
-    private bool _visible = true;
-
-    /// <summary>Показать или скрыть значок (скрываем, когда стена не на переднем плане).</summary>
-    public void SetVisible(bool visible)
-    {
-        if (_visible == visible || Handle == IntPtr.Zero) return;
-        _visible = visible;
-        ShowWindow(Handle, visible ? 5 : 0);   // SW_SHOWNOACTIVATE / SW_HIDE
-    }
+    private int _x = int.MinValue, _y = int.MinValue;
 
     public void Move(int x, int y)
     {
         if (Handle == IntPtr.Zero) return;
+        if (_x == x && _y == y) return;      // лишний SetWindowPos = мигание
+        _x = x; _y = y;
         // SWP_SHOWWINDOW не ставим: иначе скрытый значок снова покажется на каждом сдвиге
         SetWindowPos(Handle, IntPtr.Zero, x, y, Width, Height, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    /// <summary>Рисование через свой буфер: без мигания при перерисовке.</summary>
+    private void PaintBuffered(IntPtr hdc)
+    {
+        using (var bmp = new Bitmap(Math.Max(1, Width), Math.Max(1, Height)))
+        {
+            using (var g = Graphics.FromImage(bmp)) Paint(g);
+            using (var target = Graphics.FromHdc(hdc))
+            {
+                target.CompositingMode = CompositingMode.SourceCopy;
+                target.DrawImageUnscaled(bmp, 0, 0);
+            }
+        }
     }
 
     private void Invalidate()
     {
         if (Handle == IntPtr.Zero) return;
-        // прямая перерисовка: значок маленький, очередь сообщений не нужна
-        IntPtr hdc = GetDC(Handle);
-        if (hdc != IntPtr.Zero)
-        {
-            using (var g = Graphics.FromHdc(hdc)) Paint(g);
-            ReleaseDC(Handle, hdc);
-        }
+        InvalidateRect(Handle, IntPtr.Zero, false);
     }
 
     [DllImport("user32.dll")]
-    private static extern IntPtr GetDC(IntPtr hWnd);
+    private static extern bool InvalidateRect(IntPtr hWnd, IntPtr rect, bool erase);
 
     [DllImport("user32.dll")]
-    private static extern int ReleaseDC(IntPtr hWnd, IntPtr hdc);
+    private static extern IntPtr SetCapture(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool ReleaseCapture();
 
     private void Paint(Graphics g)
     {
@@ -271,8 +275,9 @@ public sealed class AudioBadgeWindow : IDisposable
             }
             else if (State == AudioBadgeState.NoTrack)
             {
-                g.DrawLine(pen, (int)(size * 0.56), (int)(size * 0.36), (int)(size * 0.79), (int)(size * 0.60));
-                g.DrawEllipse(pen, (int)(size * 0.60), (int)(size * 0.52), (int)(size * 0.17), (int)(size * 0.13));
+                // дорожки нет: динамик перечёркнут крестом
+                g.DrawLine(pen, (int)(size * 0.52), (int)(size * 0.30), (int)(size * 0.80), (int)(size * 0.70));
+                g.DrawLine(pen, (int)(size * 0.80), (int)(size * 0.30), (int)(size * 0.52), (int)(size * 0.70));
             }
             else if (State == AudioBadgeState.Busy)
             {

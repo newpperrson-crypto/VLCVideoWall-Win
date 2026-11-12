@@ -149,19 +149,38 @@ public sealed class AudioController : IDisposable
         }
     }
 
-    /// <summary>Переключить звук камеры. Возвращает false, если переключать нечего.</summary>
-    public bool Toggle(string name)
+    /// <summary>Забыть результаты проверки дорожек (стена остановлена — данные устарели).</summary>
+    public void ResetTracks()
+    {
+        lock (_sync)
+        {
+            foreach (var ch in _channels.Values) ch.Track = AudioTrackState.Unknown;
+        }
+    }
+
+    /// <summary>
+    /// Переключить звук камеры. Возвращает false, если переключать нечего.
+    /// <paramref name="startProcess"/> = false — только запомнить настройку (стена остановлена).
+    /// </summary>
+    public bool Toggle(string name, bool startProcess = true)
     {
         bool wantOn;
         lock (_sync)
         {
             Channel ch;
             if (!_channels.TryGetValue(name, out ch)) return false;
-            if (ch.Track == AudioTrackState.Absent) return false;   // дорожки нет — переключатель недоступен
+            if (startProcess && ch.Track == AudioTrackState.Absent) return false;   // дорожки нет
             if (ch.Busy) return false;
             wantOn = !ch.On;
             ch.On = wantOn;
-            ch.Busy = true;
+            ch.Busy = startProcess;
+        }
+
+        if (!startProcess)
+        {
+            var quiet = Changed;
+            if (quiet != null) quiet();
+            return true;
         }
 
         var raiser = Changed;

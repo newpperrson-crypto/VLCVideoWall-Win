@@ -267,6 +267,7 @@ public class MainForm : Form
             _preview.AudioOn = on;
             _preview.AudioTrack = track;
             _preview.AudioBusy = busy;
+            _preview.AudioTrackKnown = _wall.IsRunning;
         }
 
         int used = Math.Min(names.Count, cells.Length);
@@ -800,7 +801,8 @@ public class MainForm : Form
         var names = _cameras.Where(c => c.Enabled).Select(c => c.Name).ToList();
         if (index < 0 || index >= names.Count) return;
 
-        if (!_audio.Toggle(names[index])) { UpdateAudioHint(); return; }
+        // на остановленной стене переключатель только запоминает настройку
+        if (!_audio.Toggle(names[index], _wall.IsRunning)) { UpdateAudioHint(); return; }
 
         SaveAudioState();
         RefreshAudioUi();          // сразу показываем «принято» — значок становится Busy
@@ -859,7 +861,9 @@ public class MainForm : Form
     private void UpdateWallBadges()
     {
         var empty = new Dictionary<int, Rectangle>();
-        if (!_audio.Enabled || !_wall.IsRunning)
+        // без TCP-проб: они дорогие и заставляли значки пересоздаваться (мигание)
+        int wallPid = _wall.OwnVlcPid();
+        if (!_audio.Enabled || wallPid == 0)
         {
             _wallBadges.Sync(IntPtr.Zero, empty, p => AudioBadgeState.Off, p => "");
             return;
@@ -867,7 +871,7 @@ public class MainForm : Form
 
         IntPtr hwnd;
         Rectangle client;
-        if (!WallWindow.TryGetVideoWindow(_wall.OwnVlcPid(), out hwnd, out client))
+        if (!WallWindow.TryGetVideoWindow(wallPid, out hwnd, out client))
         {
             _wallBadges.Sync(IntPtr.Zero, empty, p => AudioBadgeState.Off, p => "");
             return;
@@ -899,8 +903,7 @@ public class MainForm : Form
 
         _wallBadges.Sync(hwnd, tiles,
             pos => AudioStateFor(pos, names),
-            pos => pos < names.Count ? names[pos] : "",
-            WallWindow.IsActive(hwnd));
+            pos => pos < names.Count ? names[pos] : "");
     }
 
     private AudioBadgeState AudioStateFor(int pos, List<string> names)
@@ -1283,6 +1286,7 @@ public class MainForm : Form
         finally
         {
             _audio.StopAll();
+            _audio.ResetTracks();     // на остановленной стене состояние дорожек неизвестно
             SetBusy(false);
             UpdateStatus();
             UpdateWallBadges();

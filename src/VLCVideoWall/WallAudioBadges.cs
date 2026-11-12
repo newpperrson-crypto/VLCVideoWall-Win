@@ -32,7 +32,7 @@ public sealed class WallAudioBadges : IDisposable
     /// <paramref name="tiles"/> — прямоугольники плиток в экранных координатах.
     /// </summary>
     public void Sync(IntPtr parent, IDictionary<int, Rectangle> tiles,
-                     Func<int, AudioBadgeState> stateFor, Func<int, string> nameFor, bool visible = true)
+                     Func<int, AudioBadgeState> stateFor, Func<int, string> nameFor)
     {
         if (parent == IntPtr.Zero || tiles == null || tiles.Count == 0 || !IsWindow(parent))
         {
@@ -73,7 +73,6 @@ public sealed class WallAudioBadges : IDisposable
             if (x < pair.Value.Left) x = pair.Value.Left;
             if (y < pair.Value.Top) y = pair.Value.Top;
             badge.Move(x, y);
-            badge.SetVisible(visible);
         }
     }
 

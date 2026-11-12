@@ -25,6 +25,12 @@ public class WallPreview : Control
     /// <summary>Идёт переключение звука (по индексу окна).</summary>
     public bool[] AudioBusy = new bool[0];
 
+    /// <summary>
+    /// Состояние звуковых дорожек известно (стена запущена и камеры проверены).
+    /// На остановленной стене значки показывают только настройку включения.
+    /// </summary>
+    public bool AudioTrackKnown;
+
     /// <summary>Клик по плитке; аргумент — порядковый номер окна.</summary>
     public event Action<int> TileClicked;
 
@@ -117,11 +123,11 @@ public class WallPreview : Control
             }
             else if (state == AudioBadgeState.NoTrack)
             {
-                // маленькая перечёркнутая нота: дорожки нет
-                g.DrawLine(pen, box.X + (int)(size * 0.58), box.Y + (int)(size * 0.34),
-                                box.X + (int)(size * 0.8), box.Y + (int)(size * 0.6));
-                g.DrawEllipse(pen, box.X + (int)(size * 0.6), box.Y + (int)(size * 0.52),
-                                   (int)(size * 0.16), (int)(size * 0.12));
+                // дорожки нет: динамик перечёркнут крестом
+                g.DrawLine(pen, box.X + (int)(size * 0.52), box.Y + (int)(size * 0.30),
+                                box.X + (int)(size * 0.80), box.Y + (int)(size * 0.70));
+                g.DrawLine(pen, box.X + (int)(size * 0.80), box.Y + (int)(size * 0.30),
+                                box.X + (int)(size * 0.52), box.Y + (int)(size * 0.70));
             }
             else if (state == AudioBadgeState.Busy)
             {
@@ -215,7 +221,8 @@ public class WallPreview : Control
                 {
                     var state = AudioBadgeState.Off;
                     if (pos < AudioBusy.Length && AudioBusy[pos]) state = AudioBadgeState.Busy;
-                    else if (pos < AudioTrack.Length && AudioTrack[pos] == AudioTrackState.Absent) state = AudioBadgeState.NoTrack;
+                    else if (AudioTrackKnown && pos < AudioTrack.Length && AudioTrack[pos] == AudioTrackState.Absent)
+                        state = AudioBadgeState.NoTrack;
                     else if (pos < AudioOn.Length && AudioOn[pos]) state = AudioBadgeState.On;
                     DrawSpeaker(g, cell, state);
                 }
