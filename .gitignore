@@ -11,6 +11,8 @@ dist/
 # В Mosaic.conf, его копиях и Mosaic.vlm хранятся логин и пароль камер.
 Mosaic.conf
 Mosaic.conf.*
+# шаблон для пользователей — не секрет, публикуется
+!config/Mosaic.conf.example
 Mosaic*.bak
 Mosaic.vlm
 Mosaic.active.vlm

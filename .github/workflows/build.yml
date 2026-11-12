@@ -16,6 +16,26 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      - name: Проверка обязательных файлов
+        shell: pwsh
+        run: |
+          $required = @(
+            'README.md',
+            'CHANGELOG.md',
+            'LICENSE',
+            'watchdog.ps1',
+            'config/Mosaic.conf.example',
+            'config/README.txt',
+            'docs/configuration.md',
+            'docs/troubleshooting.md'
+          )
+          $missing = @($required | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
+          if ($missing.Count -gt 0) {
+            Write-Error ('Нет обязательных файлов: ' + ($missing -join ', '))
+            exit 1
+          }
+          Write-Host 'все обязательные файлы на месте'
+
       - name: Сборка
         run: dotnet build src/VLCVideoWall/VLCVideoWall.csproj -c Release --nologo
 
@@ -24,6 +44,17 @@ jobs:
 
       - name: Публикация одним файлом
         run: dotnet publish src/VLCVideoWall/VLCVideoWall.csproj -c Release -o dist --nologo
+
+      - name: Проверка артефакта
+        shell: pwsh
+        run: |
+          $required = @('dist/VLCVideoWall.exe', 'watchdog.ps1', 'config/Mosaic.conf.example', 'config/README.txt', 'LICENSE')
+          $missing = @($required | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
+          if ($missing.Count -gt 0) {
+            Write-Error ('В артефакте нет файлов: ' + ($missing -join ', '))
+            exit 1
+          }
+          Write-Host 'артефакт укомплектован'
 
       - name: Публикация артефакта
         uses: actions/upload-artifact@v4
