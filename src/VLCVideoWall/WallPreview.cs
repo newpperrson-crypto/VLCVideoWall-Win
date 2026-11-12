@@ -13,6 +13,15 @@ public class WallPreview : Control
     public int CanvasH = 1080;
     public string[] Cells = new string[0];
 
+    /// <summary>Индекс плитки, звук которой слушается (-1 = звук выключен).</summary>
+    public int AudioIndex = -1;
+
+    /// <summary>Звук выключен (значок с перечёркнутым динамиком).</summary>
+    public bool AudioMuted;
+
+    /// <summary>Клик по плитке; аргумент — порядковый номер окна.</summary>
+    public event Action<int> TileClicked;
+
     public WallPreview()
     {
         DoubleBuffered = true;
@@ -34,22 +43,104 @@ public class WallPreview : Control
         return p;
     }
 
-    protected override void OnPaint(PaintEventArgs e)
+    /// <summary>Геометрия сетки: доска, число ячеек и размер шага.</summary>
+    private bool GetLayout(out Rectangle board, out int cols, out int rows, out int gap, out int cw, out int ch)
     {
-        var g = e.Graphics;
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        g.Clear(BackColor);
+        board = Rectangle.Empty; cols = 1; rows = 1; gap = 6; cw = 0; ch = 0;
 
         int pad = 16;
         var area = new Rectangle(pad, pad, Width - 2 * pad, Height - 2 * pad);
-        if (area.Width < 60 || area.Height < 60) return;
+        if (area.Width < 60 || area.Height < 60) return false;
 
         // доска в пропорциях полотна, по центру
         double target = CanvasH > 0 ? (double)CanvasW / CanvasH : 16.0 / 9.0;
         int bw = area.Width;
         int bh = (int)(bw / target);
         if (bh > area.Height) { bh = area.Height; bw = (int)(bh * target); }
-        var board = new Rectangle(area.X + (area.Width - bw) / 2, area.Y + (area.Height - bh) / 2, bw, bh);
+        board = new Rectangle(area.X + (area.Width - bw) / 2, area.Y + (area.Height - bh) / 2, bw, bh);
+
+        cols = Math.Max(1, Cols);
+        rows = Math.Max(1, Rows);
+        gap = board.Width > 500 ? 10 : 6;
+        cw = (board.Width - gap * (cols - 1)) / cols;
+        ch = (board.Height - gap * (rows - 1)) / rows;
+        return cw > 0 && ch > 0;
+    }
+
+    private static void DrawSpeaker(Graphics g, Rectangle cell, bool muted)
+    {
+        int size = Math.Min(26, Math.Min(cell.Width, cell.Height) / 3);
+        if (size < 14) return;
+        var box = new Rectangle(cell.Right - size - 6, cell.Y + 6, size, size);
+
+        using (var back = new SolidBrush(Color.FromArgb(180, 20, 24, 30)))
+        using (var path = Round(box, 6))
+            g.FillPath(back, path);
+
+        var color = muted ? Color.FromArgb(248, 113, 113) : Color.FromArgb(134, 239, 172);
+        int bx = box.X + (int)(size * 0.22);
+        int by = box.Y + (int)(size * 0.34);
+        int unit = Math.Max(2, size / 10);
+
+        using (var brush = new SolidBrush(color))
+        {
+            g.FillRectangle(brush, bx, by + unit, unit * 2, unit * 4);
+            g.FillPolygon(brush, new[]
+            {
+                new Point(bx + unit * 2, by + unit),
+                new Point(bx + unit * 4, by - unit / 2),
+                new Point(bx + unit * 4, by + unit * 6),
+                new Point(bx + unit * 2, by + unit * 4)
+            });
+        }
+        using (var pen = new Pen(color, Math.Max(1.4f, size / 14f)))
+        {
+            if (muted)
+            {
+                g.DrawLine(pen, box.X + (int)(size * 0.6), box.Y + (int)(size * 0.32),
+                                box.X + (int)(size * 0.82), box.Y + (int)(size * 0.68));
+                g.DrawLine(pen, box.X + (int)(size * 0.82), box.Y + (int)(size * 0.32),
+                                box.X + (int)(size * 0.6), box.Y + (int)(size * 0.68));
+            }
+            else
+            {
+                g.DrawArc(pen, box.X + (int)(size * 0.52), box.Y + (int)(size * 0.3),
+                               (int)(size * 0.24), (int)(size * 0.4), -55, 110);
+                g.DrawArc(pen, box.X + (int)(size * 0.58), box.Y + (int)(size * 0.2),
+                               (int)(size * 0.34), (int)(size * 0.6), -50, 100);
+            }
+        }
+    }
+
+    protected override void OnMouseClick(MouseEventArgs e)
+    {
+        base.OnMouseClick(e);
+        Rectangle board;
+        int cols, rows, gap, cw, ch;
+        if (!GetLayout(out board, out cols, out rows, out gap, out cw, out ch)) return;
+        if (!board.Contains(e.Location)) return;
+
+        int c = (e.X - board.X) / Math.Max(1, cw + gap);
+        int r = (e.Y - board.Y) / Math.Max(1, ch + gap);
+        if (c < 0 || c >= cols || r < 0 || r >= rows) return;
+
+        var cell = new Rectangle(board.X + c * (cw + gap), board.Y + r * (ch + gap), cw, ch);
+        if (!cell.Contains(e.Location)) return;   // попали в промежуток между окнами
+
+        int pos = r * cols + c;
+        var handler = TileClicked;
+        if (handler != null) handler(pos);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.Clear(BackColor);
+
+        Rectangle board;
+        int cols, rows, gap, cw, ch;
+        if (!GetLayout(out board, out cols, out rows, out gap, out cw, out ch)) return;
 
         using (var bg = new SolidBrush(Color.FromArgb(226, 233, 243)))
         using (var pen = new Pen(Color.FromArgb(198, 209, 226), 2))
@@ -58,12 +149,6 @@ public class WallPreview : Control
             g.FillPath(bg, path);
             g.DrawPath(pen, path);
         }
-
-        int cols = Math.Max(1, Cols);
-        int rows = Math.Max(1, Rows);
-        int gap = board.Width > 500 ? 10 : 6;
-        int cw = (board.Width - gap * (cols - 1)) / cols;
-        int ch = (board.Height - gap * (rows - 1)) / rows;
 
         using (var font = new Font("Segoe UI", board.Width > 600 ? 11f : 9f))
         using (var fontNum = new Font("Segoe UI", 7.5f))
@@ -99,6 +184,9 @@ public class WallPreview : Control
                         g.DrawString("свободно", font, grey, cell, sf);
                     }
                 }
+
+                // значок звука на плитке, которая сейчас звучит
+                if (busy && pos == AudioIndex) DrawSpeaker(g, cell, AudioMuted);
 
                 // номер окна в углу (показывает порядок заполнения)
                 if (cell.Width > 90 && cell.Height > 50)

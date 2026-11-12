@@ -31,6 +31,16 @@ public class WallConfig
     /// </summary>
     public bool Windowed { get; set; }
 
+    /// <summary>
+    /// Имя камеры, звук которой слушаем. Пусто = звука нет.
+    /// Mosaic в VLC звук не собирает, поэтому сторож поднимает отдельный
+    /// аудиопоток этой камеры (см. watchdog.ps1).
+    /// </summary>
+    public string AudioSource { get; set; } = "";
+
+    /// <summary>Громкость звука в процентах (0..100).</summary>
+    public int Volume { get; set; } = 80;
+
     [JsonIgnore] public int Cols { get; private set; } = 2;
     [JsonIgnore] public int Rows { get; private set; } = 2;
     [JsonIgnore] public int Windows { get { return Cols * Rows; } }
@@ -68,6 +78,17 @@ public class WallConfig
             if (t.StartsWith("vlcpath") && eq > 0)
             {
                 cfg.VlcPath = t.Substring(eq + 1).Trim().Trim('"');
+                continue;
+            }
+            if (t.StartsWith("audio") && eq > 0)
+            {
+                cfg.AudioSource = t.Substring(eq + 1).Trim().Trim('"');
+                continue;
+            }
+            if (t.StartsWith("volume") && eq > 0)
+            {
+                if (int.TryParse(t.Substring(eq + 1).Trim(), out var vol))
+                    cfg.Volume = Math.Clamp(vol, 0, 100);
                 continue;
             }
             if (t.StartsWith("windowed") && eq > 0)
@@ -158,6 +179,9 @@ public class WallConfig
         sb.AppendLine("#  cam ИМЯ rtsp://ЛОГИН:ПАРОЛЬ@АДРЕС:554/ПУТЬ");
         sb.AppendLine("#  off cam ИМЯ rtsp://...  — камера выключена в приложении, но остаётся в списке");
         sb.AppendLine("#      порядок строк = порядок окон: слева-направо, сверху-вниз");
+        sb.AppendLine("#  audio = ИМЯ камеры — звук этой камеры выводится отдельно");
+        sb.AppendLine("#          (пусто = без звука; Mosaic в VLC звук не собирает)");
+        sb.AppendLine("#  volume = громкость звука 0..100");
         sb.AppendLine("#  windowed = yes|no — запускать стену в окне размером с полотно");
         sb.AppendLine("#             (no = на весь экран, по умолчанию)");
         sb.AppendLine("#  vlcpath = путь к vlc.exe (пусто = найти автоматически)");
@@ -168,6 +192,8 @@ public class WallConfig
         sb.AppendLine("layout = " + Layout);
         sb.AppendLine("canvas = " + CanvasW + "x" + CanvasH);
         sb.AppendLine("windowed = " + (Windowed ? "yes" : "no"));
+        sb.AppendLine("audio = " + (AudioSource ?? "").Trim());
+        sb.AppendLine("volume = " + Math.Clamp(Volume, 0, 100));
         if (!string.IsNullOrWhiteSpace(VlcPath)) sb.AppendLine("vlcpath = " + VlcPath.Trim());
         if (!string.IsNullOrWhiteSpace(LogDir)) sb.AppendLine("logdir = " + LogDir.Trim());
         sb.AppendLine("logkeep = " + LogKeepDays);

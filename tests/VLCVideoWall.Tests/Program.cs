@@ -35,6 +35,9 @@ internal static class Program
         Console.WriteLine("watchdog.status:");
         StatusFileParsing();
 
+        Console.WriteLine("audio.status:");
+        AudioStatusParsing();
+
         Console.WriteLine("RTSP-проверка:");
         ProbeBasicOk();
         ProbeDigestQopAuth();
@@ -63,6 +66,8 @@ internal static class Program
             cfg.Cameras.Add(new Camera { Name = "ch2", Url = "rtsp://user:pass@192.0.2.11:554/b", Enabled = false });
             cfg.Cameras.Add(new Camera { Name = "ch3", Url = "rtsp://user:pass@192.0.2.12:554/c" });
             cfg.Windowed = true;            // стена в окне размером с полотно
+            cfg.AudioSource = "ch2";        // звук выбранной камеры
+            cfg.Volume = 55;
             cfg.Save(path);
 
             var text = File.ReadAllText(path, Encoding.UTF8);
@@ -71,6 +76,9 @@ internal static class Program
 
             var back = WallConfig.Load(path);
             Check(back.Windowed, "windowed = yes читается обратно");
+            Check(text.Contains("audio = ch2"), "источник звука пишется в Mosaic.conf");
+            Check(back.AudioSource == "ch2", "источник звука читается обратно");
+            Check(back.Volume == 55, "громкость сохраняется");
             Check(back.Cameras.Count == 3, "после сохранения и загрузки остаются все 3 камеры");
             Check(back.Cameras[0].Name == "ch1" && back.Cameras[1].Name == "ch2" && back.Cameras[2].Name == "ch3",
                 "порядок камер сохраняется");
@@ -181,6 +189,34 @@ internal static class Program
         Check(WallStatusFile.TryParse(now.Ticks + "\r\nVLM=OK\r\nplaying=x\r\ntotal=2\r\n", out st)
               && st.VlmOk && st.Playing == 0 && st.Total == 2,
             "CRLF, регистр ключа и мусор в числе не ломают разбор");
+    }
+
+    // ============================ audio.status ============================
+
+    private static void AudioStatusParsing()
+    {
+        var now = new DateTime(2026, 11, 11, 12, 0, 0, DateTimeKind.Utc);
+        var text = now.Ticks + "\nsource=ch3\nmuted=on\nvolume=45\nplaying=1\n";
+
+        AudioStatus st;
+        Check(AudioStatus.TryParse(text, out st), "audio.status разбирается");
+        Check(st != null && st.Source == "ch3" && st.HasSource, "источник звука прочитан");
+        Check(st != null && st.Muted, "признак «без звука» прочитан");
+        Check(st != null && st.Volume == 45, "громкость прочитана");
+        Check(st != null && st.Playing, "признак «играет» прочитан");
+        Check(st != null && st.IsFresh(now.AddSeconds(3), 20), "свежая запись принимается");
+        Check(st != null && !st.IsFresh(now.AddSeconds(40), 20), "устаревшая запись отклоняется");
+
+        Check(AudioStatus.TryParse(now.Ticks + "\nsource=off\n", out st) && !st.HasSource,
+            "source=off — звука нет");
+        Check(AudioStatus.TryParse(now.Ticks + "\nsource=\n", out st) && !st.HasSource,
+            "пустой source — звука нет");
+        Check(AudioStatus.TryParse(now.Ticks + "\nvolume=999\n", out st) && st.Volume == 100,
+            "громкость ограничивается 100");
+        Check(AudioStatus.TryParse(now.Ticks + "\nmuted=yes\nplaying=on\n", out st) && st.Muted && st.Playing,
+            "словесные значения on/yes понимаются");
+        Check(!AudioStatus.TryParse("", out st), "пустой файл — отказ");
+        Check(!AudioStatus.TryParse("мусор\nsource=ch1\n", out st), "без тиков — отказ");
     }
 
     // ============================ RTSP ============================

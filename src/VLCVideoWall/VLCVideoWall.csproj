@@ -10,9 +10,9 @@
     <RootNamespace>VLCVideoWall</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>app.ico</ApplicationIcon>
-    <Version>1.2.7</Version>
-    <AssemblyVersion>1.2.7.0</AssemblyVersion>
-    <FileVersion>1.2.7.0</FileVersion>
+    <Version>1.3.0</Version>
+    <AssemblyVersion>1.3.0.0</AssemblyVersion>
+    <FileVersion>1.3.0.0</FileVersion>
     <Product>VLC VideoWall</Product>
     <Description>Видеостена для Windows: мозаика RTSP-камер на VLC с самовосстановлением каналов.</Description>
     <Company>VLCVideoWall-Win contributors</Company>

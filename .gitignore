@@ -26,6 +26,9 @@ VideoWall.settings.json
 vlc.pid
 watchdog.heartbeat
 watchdog.status
+audio.status
+audio.pid
+audio.cmd
 stop.flag
 *.log
 bg_*.jpg
