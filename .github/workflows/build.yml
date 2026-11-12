@@ -36,6 +36,35 @@ jobs:
           }
           Write-Host 'все обязательные файлы на месте'
 
+      - name: Проверка состава публикации
+        shell: pwsh
+        run: |
+          # В публикации допустимы только пользовательские документы из списка.
+          # Любой новый файл документации требует явного разрешения владельца проекта.
+          $allowed = @(
+            'README.md',
+            'CHANGELOG.md',
+            'LICENSE',
+            'docs/configuration.md',
+            'docs/troubleshooting.md',
+            'config/README.txt'
+          )
+          $tracked = git ls-files
+          $docs = @($tracked | Where-Object { $_ -match '\.(md|markdown|txt)$' })
+          $extra = @($docs | Where-Object { $allowed -notcontains $_ })
+          if ($extra.Count -gt 0) {
+            Write-Host ('Лишние документы в публикации: ' + ($extra -join ', '))
+            Write-Error 'В публикацию добавлены документы, которых нет в списке разрешённых.'
+            exit 1
+          }
+          $secret = @($tracked | Where-Object { $_ -match '^(audio-temp/|\.env|.*\.xspf$|Mosaic\.conf$)' })
+          if ($secret.Count -gt 0) {
+            Write-Host ('В индексе есть служебные файлы: ' + ($secret -join ', '))
+            Write-Error 'Служебные и содержащие адреса камер файлы не должны попадать в репозиторий.'
+            exit 1
+          }
+          Write-Host ('документов в публикации: ' + $docs.Count + ', лишних нет')
+
       - name: Сборка
         run: dotnet build src/VLCVideoWall/VLCVideoWall.csproj -c Release --nologo
 

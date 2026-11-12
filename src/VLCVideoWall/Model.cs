@@ -115,7 +115,7 @@ public class WallConfig
             }
             if (t.StartsWith("off cam "))
             {
-                // VW-03: отключённая камера остаётся в конфиге и не теряется при перезапуске
+                // отключённая камера остаётся в конфиге и не теряется при перезапуске
                 var parts = t.Split(new[] { ' ', '\t' }, 4, StringSplitOptions.RemoveEmptyEntries);
                 if (parts.Length >= 4)
                     cfg.Cameras.Add(new Camera { Name = parts[2], Url = parts[3].Trim().Trim('"'), Enabled = false });

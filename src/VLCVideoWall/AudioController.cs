@@ -5,6 +5,8 @@ using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -32,12 +34,13 @@ public enum AudioChannelState
 /// <summary>
 /// Звук стены. VLC собирает мозаику только из видео (у mosaic-bridge нет аудиопараметров),
 /// поэтому каждая включённая камера получает собственный процесс VLC без видео.
-/// Процессами управляет приложение: так переключение мгновенное, а сторож не занят
-/// ожиданием команд в своём цикле опроса.
 ///
-/// Порты закрепляет только AssignPortsLocked(): порт = BasePort + номер окна камеры.
-/// Поэтому после добавления, удаления или перестановки камер повторов быть не может,
-/// а смена BasePort пересчитывает порты всем каналам.
+/// Движок работает только при явном разрешении: ActivateRuntime() вызывает приложение
+/// после успешного старта стены, DeactivateRuntime() — до остановки. Пока разрешения нет,
+/// ни Tick(), ни StartEnabled(), ни асинхронные продолжения не запускают процессы, поэтому
+/// после остановки стены звук не поднимается сам.
+///
+/// Порты назначает единственный метод AssignPortsLocked(): порт = BasePort + номер окна.
 /// </summary>
 public sealed class AudioController : IDisposable
 {
@@ -51,9 +54,11 @@ public sealed class AudioController : IDisposable
         public Process Proc;
         public bool On;                // пользователь включил звук этой камеры
         public bool Starting;          // процесс запускается прямо сейчас
-        public bool VolumeDirty;       // нужно применить громкость
-        public int Fails;              // подряд неудачных запусков
+        public bool StopUnconfirmed;   // не удалось подтвердить завершение процесса
+        public bool VolumeDirty;
+        public int Fails;              // подряд неудачных запусков (сбрасывается только по наработке)
         public DateTime NextTry = DateTime.MinValue;
+        public DateTime StartedAt = DateTime.MinValue;
         public AudioTrackState Track = AudioTrackState.Unknown;
         public AudioChannelState State = AudioChannelState.Off;
     }
@@ -62,13 +67,18 @@ public sealed class AudioController : IDisposable
     private static readonly int[] BackoffSeconds = { 2, 5, 15, 45, 120 };
     private const int MaxFails = 5;
 
+    /// <summary>Сколько процесс должен проработать, чтобы считать запуск успешным.</summary>
+    private const int StableSeconds = 20;
+
     private readonly Dictionary<string, Channel> _channels = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _sync = new();
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(2) };
     private readonly CancellationTokenSource _volumeCts = new();
     private readonly Task _volumeLoop;
     private int _basePort = 4213;
+    private volatile bool _runtimeActive;
     private bool _disposed;
+    private Task _stopTask = Task.CompletedTask;
 
     public AudioController()
     {
@@ -79,7 +89,9 @@ public sealed class AudioController : IDisposable
     public int Volume { get; set; } = 80;      // 0..100
     public string LastError { get; private set; } = "";
 
-    /// <summary>Сколько портов занимает звук.</summary>
+    /// <summary>Разрешение работы движка: включается только при работающей стене.</summary>
+    public bool RuntimeActive { get { return _runtimeActive; } }
+
     public static int PortSpanSize { get { return PortSpan; } }
 
     /// <summary>Первый порт звуковых процессов. Смена пересчитывает порты каналов.</summary>
@@ -91,24 +103,53 @@ public sealed class AudioController : IDisposable
 
     public event Action Changed;
 
+    // ---------------------------------------------------------------- разрешение работы
+
+    /// <summary>
+    /// Разрешить работу звука: вызывается после успешного старта стены.
+    /// Включённые пользователем камеры поднимаются один раз.
+    /// </summary>
+    public void ActivateRuntime()
+    {
+        if (_disposed || !Enabled) return;
+        _runtimeActive = true;
+        StartEnabled();
+    }
+
+    /// <summary>
+    /// Запретить работу звука и погасить процессы. Вызывается до остановки стены,
+    /// при неудачном старте, при выходе и в Dispose. Пользовательский выбор камер остаётся.
+    /// </summary>
+    public void DeactivateRuntime()
+    {
+        _runtimeActive = false;
+        _stopTask = Task.Run(() => StopAllProcesses());
+    }
+
+    /// <summary>Дождаться фактического завершения процессов (после DeactivateRuntime).</summary>
+    public Task WaitStoppedAsync(int timeoutMs = 6000)
+    {
+        var task = _stopTask;
+        return Task.WhenAny(task, Task.Delay(timeoutMs));
+    }
+
     public void Dispose()
     {
         _disposed = true;
-        lock (_sync)
-        {
-            foreach (var ch in _channels.Values) KillLocked(ch);
-        }
+        _runtimeActive = false;
         try { _volumeCts.Cancel(); } catch { }
-        try { _volumeLoop.Wait(800); } catch { }
+        StopAllProcesses();
         try { _volumeCts.Dispose(); } catch { }
+        try { _volumeLoop.Wait(800); } catch { }
         _http.Dispose();
+        AudioPlaylist.DeleteAll();
     }
 
     // ---------------------------------------------------------------- камеры и порты
 
     /// <summary>
-    /// Актуальный список камер. Пересчитывает порты по текущему порядку окон и
-    /// перезапускает те живые каналы, у которых сменился порт.
+    /// Актуальный список камер. Пересчитывает порты по порядку окон и перезапускает
+    /// живые каналы, у которых сменился порт (только при разрешённой работе движка).
     /// </summary>
     public void SetCameras(IEnumerable<Camera> cameras)
     {
@@ -121,7 +162,7 @@ public sealed class AudioController : IDisposable
             foreach (var gone in _channels.Where(kv => !keep.Contains(kv.Key)).Select(kv => kv.Key).ToList())
             {
                 var ch = _channels[gone];
-                KillLocked(ch);
+                KillChannelBlocking(ch);
                 _channels.Remove(gone);
             }
 
@@ -145,7 +186,8 @@ public sealed class AudioController : IDisposable
             AssignPortsLocked(restart);
         }
 
-        foreach (var ch in restart) RestartChannel(ch);
+        if (!_runtimeActive) return;
+        foreach (var ch in restart) RestartChannelAsync(ch);
     }
 
     /// <summary>Сменить базовый порт: порты пересчитываются, живые каналы перезапускаются.</summary>
@@ -159,7 +201,8 @@ public sealed class AudioController : IDisposable
             _basePort = clamped;
             AssignPortsLocked(restart);
         }
-        foreach (var ch in restart) RestartChannel(ch);
+        if (!_runtimeActive) return;
+        foreach (var ch in restart) RestartChannelAsync(ch);
     }
 
     /// <summary>Единственное место, где назначаются порты. Требует _sync.</summary>
@@ -174,7 +217,6 @@ public sealed class AudioController : IDisposable
         }
     }
 
-    /// <summary>Карта «камера → порт» (для журнала и проверок).</summary>
     public List<KeyValuePair<string, int>> PortMap()
     {
         lock (_sync)
@@ -260,6 +302,7 @@ public sealed class AudioController : IDisposable
             {
                 ch.On = set.Contains(ch.Name);
                 ch.Starting = false;
+                ch.StopUnconfirmed = false;
                 ch.Fails = 0;
                 ch.NextTry = DateTime.MinValue;
                 ch.State = AudioChannelState.Off;
@@ -312,7 +355,7 @@ public sealed class AudioController : IDisposable
         {
             Channel ch;
             if (!_channels.TryGetValue(name, out ch)) return false;
-            if (startProcess && ch.Track == AudioTrackState.Absent) return false;   // дорожки нет
+            if (startProcess && ch.Track == AudioTrackState.Absent) return false;
             if (ch.Starting || ch.State == AudioChannelState.Starting || ch.State == AudioChannelState.Recovering)
                 return false;
 
@@ -321,28 +364,31 @@ public sealed class AudioController : IDisposable
             ch.Fails = 0;
             ch.NextTry = DateTime.MinValue;
             ch.State = wantOn ? AudioChannelState.Starting : AudioChannelState.Off;
-            if (startProcess && wantOn) ch.Starting = true;
+            if (startProcess && wantOn && _runtimeActive && Enabled) ch.Starting = true;
         }
 
         RaiseChanged();
 
         if (!startProcess) return true;
+        if (!_runtimeActive || !Enabled) return true;      // стена стоит — только запомнили
 
         if (wantOn) Task.Run(() => StartChannel(name));
         else Task.Run(() => { StopChannel(name); RaiseChanged(); });
         return true;
     }
 
-    /// <summary>Поднять процессы для включённых камер (вызывается при запуске стены).</summary>
+    /// <summary>Поднять процессы включённых камер (только при разрешённой работе движка).</summary>
     public void StartEnabled()
     {
-        if (!Enabled) return;
+        if (_disposed || !Enabled || !_runtimeActive) return;
+
         var start = new List<string>();
         lock (_sync)
         {
             foreach (var ch in _channels.Values)
             {
                 if (!ch.On) continue;
+                if (ch.StopUnconfirmed) continue;
                 if (ch.Starting || ch.State == AudioChannelState.Playing) continue;
                 if (ch.Proc != null && !SafeExited(ch.Proc)) continue;
                 ch.Starting = true;
@@ -355,11 +401,12 @@ public sealed class AudioController : IDisposable
 
     /// <summary>
     /// Периодический контроль: поднимает каналы, которые должны играть, но процесс пропал.
-    /// Отличает намеренное выключение (On=false) от аварии, делает backoff с ограничением попыток.
+    /// Счётчик неудач сбрасывается только после устойчивой работы, поэтому быстро падающий
+    /// процесс не перезапускается бесконечно.
     /// </summary>
     public void Tick()
     {
-        if (_disposed) return;
+        if (_disposed || !Enabled || !_runtimeActive) return;
 
         var start = new List<string>();
         bool changed = false;
@@ -376,19 +423,24 @@ public sealed class AudioController : IDisposable
                         ch.State = AudioChannelState.Playing;
                         changed = true;
                     }
+                    // устойчивая работа — только теперь сбрасываем счётчик неудач
+                    if (ch.Fails > 0 && ch.StartedAt != DateTime.MinValue &&
+                        (DateTime.UtcNow - ch.StartedAt).TotalSeconds >= StableSeconds)
+                    {
+                        ch.Fails = 0;
+                        ch.NextTry = DateTime.MinValue;
+                    }
                     continue;
                 }
 
-                if (!ch.On) continue;                          // выключено пользователем — не поднимаем
-                if (!Enabled) continue;                        // звук выключен целиком
+                if (!ch.On) continue;
                 if (ch.Track == AudioTrackState.Absent) continue;
-                if (ch.Starting) continue;
+                if (ch.Starting || ch.StopUnconfirmed) continue;
 
-                if (ch.Proc != null) { KillLocked(ch); ch.Proc = null; }
+                if (ch.Proc != null) { KillChannelBlocking(ch); ch.Proc = null; }
 
                 if (ch.State == AudioChannelState.Playing || ch.State == AudioChannelState.Starting)
                 {
-                    // был живым и пропал — восстановление
                     ch.Fails++;
                     changed = true;
                     if (ch.Fails > MaxFails)
@@ -427,7 +479,7 @@ public sealed class AudioController : IDisposable
         lock (_sync)
         {
             if (!_channels.TryGetValue(name, out ch)) return;
-            if (_disposed || !Enabled || !ch.On)
+            if (_disposed || !Enabled || !_runtimeActive || !ch.On || ch.StopUnconfirmed)
             {
                 ch.Starting = false;
                 ch.State = AudioChannelState.Off;
@@ -475,6 +527,17 @@ public sealed class AudioController : IDisposable
         args.Append("--http-password ").Append(password).Append(' ');
         args.Append('"').Append(playlist).Append('"');
 
+        // перед запуском повторно проверяем, что остановка не началась
+        lock (_sync)
+        {
+            if (_disposed || !_runtimeActive || !_channels.ContainsKey(name) || !_channels[name].On)
+            {
+                if (_channels.ContainsKey(name)) _channels[name].Starting = false;
+                AudioPlaylist.Delete(name);
+                return;
+            }
+        }
+
         try
         {
             var psi = new ProcessStartInfo(exe, args.ToString())
@@ -487,19 +550,21 @@ public sealed class AudioController : IDisposable
 
             lock (_sync)
             {
-                if (!_channels.TryGetValue(name, out ch) || (!ch.On && !_disposed))
+                if (!_channels.TryGetValue(name, out ch) || !_runtimeActive || _disposed || !ch.On)
                 {
-                    try { proc.Kill(); } catch { }
+                    // остановка пришла, пока процесс создавался — гасим сразу
+                    try { if (!SafeExited(proc)) proc.Kill(); } catch { }
                     try { proc.Dispose(); } catch { }
                     AudioPlaylist.Delete(name);
+                    if (ch != null) ch.Starting = false;
                     return;
                 }
                 ch.Proc = proc;
                 ch.Starting = false;
-                ch.Fails = 0;
-                ch.NextTry = DateTime.MinValue;
+                ch.StartedAt = DateTime.UtcNow;
                 ch.State = AudioChannelState.Playing;
                 ch.VolumeDirty = true;
+                // Fails НЕ сбрасываем: успешный старт процесса ещё не значит, что звук идёт
             }
             LastError = "";
             RaiseChanged();
@@ -540,15 +605,18 @@ public sealed class AudioController : IDisposable
         {
             Channel ch;
             if (!_channels.TryGetValue(name, out ch)) return;
-            KillLocked(ch);
+            KillChannelBlocking(ch);
             ch.Starting = false;
-            ch.State = AudioChannelState.Off;
+            if (!ch.StopUnconfirmed) ch.State = AudioChannelState.Off;
         }
         AudioPlaylist.Delete(name);
     }
 
-    /// <summary>Смена порта/адреса у работающего канала: гасим старый, поднимаем новый.</summary>
-    private void RestartChannel(Channel ch)
+    /// <summary>
+    /// Смена порта/адреса у работающего канала: гасим старый, подтверждаем завершение,
+    /// затем поднимаем новый. Если завершение не подтверждено, второй экземпляр не создаём.
+    /// </summary>
+    private void RestartChannelAsync(Channel ch)
     {
         string name = ch.Name;
         lock (_sync)
@@ -557,64 +625,109 @@ public sealed class AudioController : IDisposable
             if (!_channels.TryGetValue(name, out current) || !ReferenceEquals(current, ch)) return;
             ch.Starting = true;
             ch.State = AudioChannelState.Starting;
-            KillLocked(ch);
         }
         AudioPlaylist.Delete(name);
         RaiseChanged();
 
         Task.Run(() =>
         {
+            bool stopped;
             lock (_sync)
             {
                 Channel current;
                 if (!_channels.TryGetValue(name, out current)) return;
+                stopped = KillChannelBlocking(current);
                 current.Starting = false;
-                if (_disposed || !Enabled || !current.On)
+                if (!stopped)
+                {
+                    current.State = AudioChannelState.Failed;
+                    LastError = "не удалось завершить звук камеры " + name + " перед сменой порта";
+                    return;
+                }
+                if (_disposed || !_runtimeActive || !Enabled || !current.On)
                 {
                     current.State = AudioChannelState.Off;
                     return;
                 }
+                current.Fails = 0;
+                current.NextTry = DateTime.MinValue;
             }
-            StartChannel(name);
+            RaiseChanged();
+            if (stopped) StartChannel(name);
         });
     }
 
-    private void KillLocked(Channel ch)
+    /// <summary>
+    /// Погасить процесс и подтвердить завершение. При неудаче процесс остаётся в учёте
+    /// (ch.Proc) и помечается StopUnconfirmed — второй экземпляр на тот же порт не пойдёт.
+    /// Возвращает true, если процесс завершён (или его не было).
+    /// </summary>
+    private bool KillChannelBlocking(Channel ch)
     {
         var proc = ch.Proc;
-        ch.Proc = null;
         ch.VolumeDirty = false;
-        if (proc == null) return;
+        if (proc == null)
+        {
+            ch.StopUnconfirmed = false;
+            return true;
+        }
+
+        bool exited;
         try
         {
             if (!SafeExited(proc))
             {
                 proc.Kill();
-                try { proc.WaitForExit(1500); } catch { }
+                exited = proc.WaitForExit(3000);
+            }
+            else
+            {
+                exited = true;
             }
         }
-        catch { }
+        catch (Exception e)
+        {
+            LastError = "завершение звука: " + e.Message;
+            exited = SafeExited(proc);
+        }
+
+        if (!exited)
+        {
+            ch.StopUnconfirmed = true;
+            ch.State = AudioChannelState.Failed;
+            return false;
+        }
+
         try { proc.Dispose(); } catch { }
+        ch.Proc = null;
+        ch.StopUnconfirmed = false;
+        ch.StartedAt = DateTime.MinValue;
+        return true;
     }
 
-    public void StopAll()
+    private void StopAllProcesses()
     {
-        var list = new List<Channel>();
+        List<string> names;
         lock (_sync)
         {
+            names = _channels.Values.Select(c => c.Name).ToList();
             foreach (var ch in _channels.Values)
             {
-                // настройка пользователя (On) сохраняется: остановка стены не должна её терять,
-                // иначе после следующего запуска звук не поднимется
-                KillLocked(ch);
+                // пользовательский выбор (On) сохраняется: остановка стены его не теряет
+                KillChannelBlocking(ch);
                 ch.Starting = false;
                 ch.Fails = 0;
                 ch.NextTry = DateTime.MinValue;
-                ch.State = AudioChannelState.Off;
-                list.Add(ch);
+                if (!ch.StopUnconfirmed) ch.State = AudioChannelState.Off;
             }
         }
         AudioPlaylist.DeleteAll();
+    }
+
+    /// <summary>Совместимость: погасить всё и запретить работу движка.</summary>
+    public void StopAll()
+    {
+        DeactivateRuntime();
     }
 
     public int PlayingCount()
@@ -634,7 +747,6 @@ public sealed class AudioController : IDisposable
         return (int)(Math.Clamp(percent, 0, 100) * 256 / 100.0);
     }
 
-    /// <summary>Громкость: все запущенные потоки получат последнее значение.</summary>
     public void ApplyVolumeAll()
     {
         lock (_sync)

@@ -30,7 +30,7 @@ public class WallController
     private const int StatusTimeoutSeconds = 20;
 
     /// <summary>
-    /// VW-01: сторож пишет PID и время старта своего VLC. Свои процессы определяем только
+    /// сторож пишет PID и время старта своего VLC. Свои процессы определяем только
     /// по этому файлу, а не по пути к vlc.exe — иначе закрывается VLC, открытый пользователем.
     /// </summary>
     private bool TryGetOwnVlc(out int pid, out Process proc)
@@ -63,7 +63,7 @@ public class WallController
     }
 
     /// <summary>
-    /// FUP-05: сторож жив, если свежий heartbeat-файл. Порт слушателя — только резерв
+    /// сторож жив, если свежий heartbeat-файл. Порт слушателя — только резерв
     /// (для сборок сторожа без heartbeat): очередь подключений может копиться, а
     /// «порт открыт» само по себе ничего не доказывает.
     /// </summary>
@@ -135,7 +135,7 @@ public class WallController
     public bool IsRunning { get { return State == WallState.Running; } }
 
     /// <summary>
-    /// FUP-03/FUP2-04: «работает» — это живой сторож, свой VLC, отвечающий порт
+    /// исправление/«работает» — это живой сторож, свой VLC, отвечающий порт
     /// И подтверждение сторожа, что он действительно получил ответ VLM.
     /// Открытый TCP-порт сам по себе зелёного статуса не даёт.
     /// </summary>
@@ -157,10 +157,10 @@ public class WallController
     /// <summary>Есть ли у стены живые компоненты: свой VLC или сторож.</summary>
     public bool HasAnyComponents { get { return IsVlcRunning() || IsGuardBusy(); } }
 
-    /// <summary>FUP2-03: «можно запустить» — только когда останавливать нечего.</summary>
+    /// <summary>«можно запустить» — только когда останавливать нечего.</summary>
     public bool CanStart { get { return !HasAnyComponents; } }
 
-    /// <summary>FUP2-03: «есть что останавливать» — и в состоянии VlcWithoutGuard тоже.</summary>
+    /// <summary>«есть что останавливать» — и в состоянии VlcWithoutGuard тоже.</summary>
     public bool CanStop { get { return HasAnyComponents; } }
 
     /// <summary>Стена занята: её нельзя запускать заново (кнопки и меню трея).</summary>
@@ -183,7 +183,7 @@ public class WallController
             var sw0 = Stopwatch.StartNew();
             while (sw0.ElapsedMilliseconds < 8000 && IsVlcRunning()) await Task.Delay(250);
 
-            // FUP3-01: второй экземпляр не поднимаем, если прежний так и не завершился
+            // второй экземпляр не поднимаем, если прежний так и не завершился
             if (IsVlcRunning())
                 throw new InvalidOperationException(
                     "Предыдущий VLC не завершился" +
@@ -215,17 +215,17 @@ public class WallController
         while (sw.ElapsedMilliseconds < timeoutMs)
         {
             if (!File.Exists(StopFlag)) break;                  // сторож снял флаг — вышел штатно
-            // FUP2-01: если сторожа нет, флаг снимать некому — нельзя ждать полный таймаут
+            // если сторожа нет, флаг снимать некому — нельзя ждать полный таймаут
             if (!IsGuardBusy()) break;
             await Task.Delay(200);
         }
 
-        // FUP3-01: завершение подтверждаем ожиданием, PID-файл удаляем только после него
+        // завершение подтверждаем ожиданием, PID-файл удаляем только после него
         try { if (_proc != null && !_proc.HasExited) _proc.Kill(true); } catch { }
         await KillOwnVlcAsync();
         try { if (File.Exists(StopFlag)) File.Delete(StopFlag); } catch { }
 
-        // FUP2-01: успех — это отсутствие ВСЕХ наших компонентов, а не «состояние не Running»
+        // успех — это отсутствие ВСЕХ наших компонентов, а не «состояние не Running»
         sw.Restart();
         while (sw.ElapsedMilliseconds < 12000 && (IsGuardBusy() || IsVlcRunning())) await Task.Delay(200);
 
@@ -311,7 +311,7 @@ public class WallController
     public string LastKillError { get { return _lastKillError; } }
 
     /// <summary>
-    /// FUP3-01: завершение только собственного VLC (PID + время старта) с подтверждением.
+    /// завершение только собственного VLC (PID + время старта) с подтверждением.
     /// PID-файл удаляется лишь после фактического выхода процесса — иначе приложение
     /// теряет возможность остановить его повторно и может объявить ложный успех.
     /// </summary>

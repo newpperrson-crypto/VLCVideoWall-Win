@@ -13,7 +13,7 @@ public class MainForm : Form
     private readonly string _confPath;
     private readonly string _settingsPath;
 
-    // VW-08: одна операция со стеной за раз — кнопки, трей и таймеры не должны наслаиваться
+    // одна операция со стеной за раз — кнопки, трей и таймеры не должны наслаиваться
     private readonly SemaphoreSlim _opLock = new SemaphoreSlim(1, 1);
     private readonly WallController _wall;
     private readonly BindingList<Camera> _cameras = new();
@@ -554,15 +554,15 @@ public class MainForm : Form
         var portRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 6, 0, 0) };
         portRow.Controls.Add(new Label { Text = "порты: стена", AutoSize = true, Margin = new Padding(0, 8, 6, 0) });
         _numPortWall = MakePortBox();
-        _numPortWall.ValueChanged += (s, e) => { if (!_loading) ApplyPorts(); };
+        _numPortWall.ValueChanged += (s, e) => { if (!_loading) UpdatePortHint(); };
         portRow.Controls.Add(_numPortWall);
         portRow.Controls.Add(new Label { Text = "сторож", AutoSize = true, Margin = new Padding(14, 8, 6, 0) });
         _numPortGuard = MakePortBox();
-        _numPortGuard.ValueChanged += (s, e) => { if (!_loading) ApplyPorts(); };
+        _numPortGuard.ValueChanged += (s, e) => { if (!_loading) UpdatePortHint(); };
         portRow.Controls.Add(_numPortGuard);
         portRow.Controls.Add(new Label { Text = "звук", AutoSize = true, Margin = new Padding(14, 8, 6, 0) });
         _numPortAudio = MakePortBox();
-        _numPortAudio.ValueChanged += (s, e) => { if (!_loading) ApplyPorts(); };
+        _numPortAudio.ValueChanged += (s, e) => { if (!_loading) UpdatePortHint(); };
         portRow.Controls.Add(_numPortAudio);
         _portHint = new Label { AutoSize = true, ForeColor = Color.FromArgb(93, 107, 127), Margin = new Padding(14, 8, 0, 0) };
         portRow.Controls.Add(_portHint);
@@ -863,10 +863,15 @@ public class MainForm : Form
         _audio.Enabled = _chkAudio.Checked;
         _audio.SetCameras(_cameras);
 
-        if (!_audio.Enabled) _audio.StopAll();
+        if (!_audio.Enabled)
+        {
+            _audio.DeactivateRuntime();
+        }
         else
         {
-            if (_wall.IsRunning) _audio.StartEnabled();
+            // движок включаем только у работающей стены: на остановленной звук не стартует
+            if (_wall.IsRunning) _audio.ActivateRuntime();
+            else _audio.DeactivateRuntime();
             _audio.ProbeTracks();
         }
 
@@ -919,15 +924,6 @@ public class MainForm : Form
     {
         if (index < 0 || index >= CornerNames.Length) return "bottom-right";
         return CornerNames[index];
-    }
-
-    /// <summary>Порты применяются сразу: стена при следующем запуске, звук — при переключении.</summary>
-    private void ApplyPorts()
-    {
-        _wall.VlcHttpPort = (int)_numPortWall.Value;
-        _wall.GuardPort = (int)_numPortGuard.Value;
-        _audio.BasePort = (int)_numPortAudio.Value;
-        UpdatePortHint();
     }
 
     private void OnBadgeCornerChanged()
@@ -1130,7 +1126,7 @@ public class MainForm : Form
         var state = s.State;
         _lastState = state;
         bool working = state == WallState.Running;
-        bool canStart = state == WallState.Stopped;   // FUP2-03: запускать можно только «с нуля»
+        bool canStart = state == WallState.Stopped;   // запускать можно только «с нуля»
         bool canStop = state != WallState.Stopped;    // ...а останавливать — если есть что
 
         string text;
@@ -1326,7 +1322,7 @@ public class MainForm : Form
     // ============================== стена ==============================
 
     /// <summary>
-    /// FUP3-03: только элементы интерфейса. Никаких проверок процессов, файлов и портов —
+    /// только элементы интерфейса. Никаких проверок процессов, файлов и портов —
     /// иначе поток UI подвисает на каждом обновлении статуса.
     /// Кнопки после снятия флага приводит в порядок ближайший снимок состояния.
     /// </summary>
@@ -1369,6 +1365,10 @@ public class MainForm : Form
 
         try
         {
+            // действующие порты берём из сохранённой конфигурации в момент старта
+            _wall.VlcHttpPort = _cfg.PortWall;
+            _wall.GuardPort = _cfg.PortGuard;
+
             SetBusy(true);
             await _wall.StartAsync();
 
@@ -1384,11 +1384,12 @@ public class MainForm : Form
             else if (_chkTrayMin.Checked)
                 HideToTray();   // стена на весь экран — окно убираем в трей
 
-            // звук: поднимаем процессы включённых камер и уточняем дорожки
+            // звук: движок разрешён только после успешного старта стены
             if (_audio.Enabled)
             {
                 _audio.SetCameras(_cameras);
-                _audio.StartEnabled();
+                _audio.SetBasePort(_cfg.PortAudio);
+                _audio.ActivateRuntime();
                 _audio.ProbeTracks();
             }
             RefreshAudioUi();
@@ -1409,7 +1410,7 @@ public class MainForm : Form
         finally { _opLock.Release(); }
     }
 
-    /// <summary>FUP3-02: остановка без захвата блокировки — вызывающий уже держит её.</summary>
+    /// <summary>остановка без захвата блокировки — вызывающий уже держит её.</summary>
     private async Task<bool> StopWallCore()
     {
         bool ok = false;
@@ -1435,7 +1436,8 @@ public class MainForm : Form
         }
         finally
         {
-            _audio.StopAll();
+            _audio.DeactivateRuntime();                 // запрещаем восстановление до остановки
+            try { await _audio.WaitStoppedAsync(6000); } catch { }
             _audio.ResetTracks();     // на остановленной стене состояние дорожек неизвестно
             SetBusy(false);
             UpdateStatus();
@@ -1445,7 +1447,7 @@ public class MainForm : Form
         return ok;
     }
 
-    /// <summary>FUP3-03: таймер прогресса меняет только текст статуса.</summary>
+    /// <summary>таймер прогресса меняет только текст статуса.</summary>
     private System.Windows.Forms.Timer StartStopProgress()
     {
         var sw = Stopwatch.StartNew();
@@ -1462,12 +1464,12 @@ public class MainForm : Form
     private async Task RestartWall()
     {
         if (_exiting) return;
-        // FUP3-02: остановка и запуск идут под одной блокировкой — между ними
+        // остановка и запуск идут под одной блокировкой — между ними
         // не может вклиниться другая операция или выход
         if (!_opLock.Wait(0)) { WarnBusy(); return; }
         try
         {
-            // VW-08: не запускаем новую стену, пока не подтверждено, что старая остановилась
+            // не запускаем новую стену, пока не подтверждено, что старая остановилась
             bool stopped = await StopWallCore();
             if (!stopped)
             {
@@ -1508,12 +1510,11 @@ public class MainForm : Form
             return;
         }
 
+        // порты сохраняются в Mosaic.conf и применяются при следующем запуске стены:
+        // работающая стена продолжает использовать свои действующие порты
         _cfg.PortWall = (int)_numPortWall.Value;
         _cfg.PortGuard = (int)_numPortGuard.Value;
         _cfg.PortAudio = (int)_numPortAudio.Value;
-        _wall.VlcHttpPort = _cfg.PortWall;
-        _wall.GuardPort = _cfg.PortGuard;
-        _audio.BasePort = _cfg.PortAudio;
 
         _cfg.Layout = _cols.Value + "x" + _rows.Value;
         _cfg.Windowed = _chkWindowed.Checked;
@@ -1844,8 +1845,8 @@ public class MainForm : Form
         }
 
         // полный выход: сначала автоматически гасим стену.
-        // FUP2-02: останавливать надо при ЛЮБОМ живом компоненте, а не только в состоянии Running.
-        // FUP3-02: флаги ставим ДО первого await и до вызова асинхронной процедуры —
+        // останавливать надо при ЛЮБОМ живом компоненте, а не только в состоянии Running.
+        // флаги ставим ДО первого await и до вызова асинхронной процедуры —
         // повторные нажатия «Выход» не запускают вторую остановку.
         // Решение «есть ли что останавливать» принимает StopAsync: дешёвая проверка файлов
         // пропускала момент, когда сторож уже запущен, а vlc.pid ещё не создан.
@@ -1880,7 +1881,7 @@ public class MainForm : Form
     }
 
     /// <summary>
-    /// FUP3-02: выход под той же блокировкой, что и остальные операции со стеной.
+    /// выход под той же блокировкой, что и остальные операции со стеной.
     /// Вызывается только из OnFormClosing, который уже выставил _exitRunning и _exiting.
     /// </summary>
     private async void StopWallThenClose()
@@ -1907,7 +1908,7 @@ public class MainForm : Form
             catch { result = null; }
             finally { progress.Dispose(); }
 
-            // FUP2-01/FUP2-04: успех — только подтверждённое завершение всех наших компонентов
+            // исправление/успех — только подтверждённое завершение всех наших компонентов
             if (result == null || !result.Stopped)
             {
                 string why = result != null && !string.IsNullOrEmpty(result.Note)

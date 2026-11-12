@@ -162,7 +162,7 @@ internal static class Program
     }
 
     /// <summary>
-    /// FUP3-01: файл vlc.pid с чужим временем старта не должен превращать посторонний
+    /// файл vlc.pid с чужим временем старта не должен превращать посторонний
     /// процесс в «свой» — иначе приложение завершит чужой vlc.exe.
     /// </summary>
     private static void FakePidFileRejected()
@@ -257,6 +257,16 @@ internal static class Program
 
             string problem;
             Check(audio.PortsConsistent(out problem), "инвариант портов соблюдён");
+
+            // движок запрещён (стена остановлена): запуск звука не происходит
+            audio.SetCameras(new[] { Cam("A", "rtsp://192.0.2.1/a") });
+            audio.Enabled = true;
+            Check(!audio.RuntimeActive, "движок звука по умолчанию запрещён");
+            Check(audio.Toggle("A", true), "переключение при остановленной стене принимается");
+            Check(audio.IsOn("A"), "настройка камеры запоминается");
+            Check(audio.PlayingCount() == 0, "при остановленной стене процесс не запускается");
+            audio.Tick();
+            Check(audio.PlayingCount() == 0, "Tick не запускает звук при остановленной стене");
 
             // границы диапазона
             audio.SetBasePort(100);

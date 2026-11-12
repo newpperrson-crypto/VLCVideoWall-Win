@@ -29,7 +29,7 @@ $HEARTBEAT_FILE = Join-Path $BASE 'watchdog.heartbeat'
 $WALL_STATUS_FILE = Join-Path $BASE 'watchdog.status'
 
 $HTTP_PORT = 4212
-# VW-07: пароль HTTP-интерфейса VLC уникален для каждого запуска и не попадает в журнал
+# пароль HTTP-интерфейса VLC уникален для каждого запуска и не попадает в журнал
 $HTTP_PASS = ([guid]::NewGuid().ToString('N')).Substring(0, 16)
 $script:AuthHeader = 'Basic ' + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(':' + $HTTP_PASS))
 
@@ -262,7 +262,7 @@ function Initialize-Scene {
 # ------------------------- служебное -------------------------
 
 function Write-VlcPid($proc) {
-    # VW-01: приложение должно завершать только свой VLC — передаём PID и время старта
+    # приложение должно завершать только свой VLC — передаём PID и время старта
     try {
         $p = Get-Process -Id $proc.Id -ErrorAction Stop
         $line = '{0} {1}' -f $p.Id, $p.StartTime.ToUniversalTime().Ticks
@@ -280,7 +280,7 @@ function Remove-VlcPid {
 }
 
 function Drain-Guard($listener) {
-    # VW-02: подключения надо принимать и закрывать, иначе очередь слушателя копится
+    # подключения надо принимать и закрывать, иначе очередь слушателя копится
     if (-not $listener) { return }
     try {
         while ($listener.Pending()) {
@@ -449,7 +449,7 @@ function Get-LaunchDir {
 
 
 function Get-OwnVlcFromPid {
-    # FUP4-01: свой прежний VLC по vlc.pid (PID + время старта), чужой процесс не трогаем
+    # свой прежний VLC по vlc.pid (PID + время старта), чужой процесс не трогаем
     try {
         $f = Join-Path $BASE 'vlc.pid'
         if (-not (Test-Path -LiteralPath $f)) { return $null }
@@ -641,7 +641,7 @@ public struct MONITORINFO {
 }
 
 function Stop-MosaicVlc($proc, [int]$attempts = 3) {
-    # FUP3-01/FUP4-01: vlc.pid удаляем только после ПОДТВЕРЖДЁННОГО завершения.
+    # исправление/vlc.pid удаляем только после ПОДТВЕРЖДЁННОГО завершения.
     # Если VLC не умер (отказ в доступе, зависание) — файл остаётся, а вызывающий
     # код обязан считать остановку неудачной и НЕ запускать новый экземпляр.
     if (-not $proc) { return $true }
@@ -676,7 +676,7 @@ function Stop-MosaicVlc($proc, [int]$attempts = 3) {
 }
 
 function Write-Heartbeat {
-    # FUP-05: приложение считает сторожа живым по свежести этого файла,
+    # приложение считает сторожа живым по свежести этого файла,
     # а не по факту подключения к порту (очередь слушателя может копиться).
     try {
         $nowTicks = [DateTime]::UtcNow.Ticks
@@ -687,7 +687,7 @@ function Write-Heartbeat {
 }
 
 function Write-WallStatus([string]$vlm, [int]$playing, [int]$total) {
-    # FUP2-04: графическое приложение не знает пароль HTTP-интерфейса VLC,
+    # графическое приложение не знает пароль HTTP-интерфейса VLC,
     # поэтому сторож публикует результат СВОЕГО обращения к VLM.
     # Открытый TCP-порт сам по себе здоровьем интерфейса не считается.
     try {
@@ -734,7 +734,7 @@ function Start-SleepChecked([int]$seconds) {
 
 function Complete-Stop($proc, [string]$why) {
     # Единый выход по stop.flag: гасим VLC, снимаем флаг — приложение сразу видит остановку.
-    # FUP4-01: если VLC не завершился, это не скрываем: vlc.pid остаётся, приложение
+    # если VLC не завершился, это не скрываем: vlc.pid остаётся, приложение
     # увидит живой процесс и сообщит, что стена не остановлена.
     Write-Log $why
     $stopped = Stop-MosaicVlc $proc
@@ -789,7 +789,7 @@ function Invoke-Watchdog {
     $hang = 0
     $failStarts = 0
 
-    # FUP4-01: если прошлый VLC так и не был завершён, второй экземпляр не поднимаем —
+    # если прошлый VLC так и не был завершён, второй экземпляр не поднимаем —
     # иначе два процесса подерутся за порт 4212, а vlc.pid будет перезаписан
     $leftover = Get-OwnVlcFromPid
     if ($leftover) {
@@ -833,7 +833,7 @@ function Invoke-Watchdog {
             if ($wait -ne 'ok') {
                 $failStarts++
                 Write-Log ('HTTP-интерфейс VLC не поднялся (попытка {0} из 3)' -f $failStarts)
-                # FUP4-01: пока старый процесс жив, второй экземпляр не запускаем
+                # пока старый процесс жив, второй экземпляр не запускаем
                 if (-not (Stop-MosaicVlc $proc)) {
                     Write-Log 'ОСТАНОВ: VLC не завершился — второй экземпляр не запускаю, vlc.pid сохранён'
                     return 1
@@ -874,7 +874,7 @@ function Invoke-Watchdog {
             Write-Log ('HTTP-интерфейс VLC не отвечает ({0}/{1}): {2}' -f $hang, $HANG_POLLS, $_.Exception.Message)
             if ($hang -ge $HANG_POLLS) {
                 Write-Log 'VLC завис - жёсткий перезапуск приложения'
-                # FUP4-01: перезапуск только после подтверждённого завершения
+                # перезапуск только после подтверждённого завершения
                 if (-not (Stop-MosaicVlc $proc)) {
                     Write-Log 'ОСТАНОВ: зависший VLC не завершился — перезапуск отменён, vlc.pid сохранён'
                     return 1
@@ -910,7 +910,7 @@ function Invoke-Watchdog {
 
             if ($now -lt $graceUntil -or $c.Fails -lt $BAD_POLLS) { continue }
 
-            # FUP-01: сетевой опрос камеры только если истёк интервал опроса.
+            # сетевой опрос камеры только если истёк интервал опроса.
             # Иначе неверный пароль превращается в подбор: OPTIONS каждые 5 секунд,
             # и камера блокирует IP клиента.
             if ($now -lt $c.NextProbe) { continue }
