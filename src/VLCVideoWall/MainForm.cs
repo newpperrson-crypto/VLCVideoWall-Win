@@ -108,6 +108,9 @@ public class MainForm : Form
         Size = new Size(1020, 740);
         Font = new Font("Segoe UI", 9f);
 
+        // на старте чистим плейлисты прошлого запуска: в них адреса камер с паролями
+        try { AudioPlaylist.DeleteAll(); } catch { }
+
         BuildUi();
         LoadAll();
         BuildTray();
