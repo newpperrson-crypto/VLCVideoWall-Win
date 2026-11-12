@@ -120,7 +120,12 @@ public class MainForm : Form
         _wallBadges.Toggled += pos => ToggleAudioByIndex(pos);
         _audio.Changed += RefreshAudioUi;
         _audioTimer = new System.Windows.Forms.Timer { Interval = 700 };
-        _audioTimer.Tick += (s, e) => { UpdateWallBadges(); UpdateAudioHint(); };
+        _audioTimer.Tick += (s, e) =>
+        {
+            _audio.Tick();          // восстановление упавших звуковых процессов
+            UpdateWallBadges();
+            UpdateAudioHint();
+        };
         _audioTimer.Start();
 
         _logTimer = new System.Windows.Forms.Timer { Interval = 5000 };
@@ -723,6 +728,7 @@ public class MainForm : Form
         UpdateInfo();
         LoadLog(false);
         _wall.VlcPath = EffectiveVlcPath();
+        VlcLocator.Configured = _wall.VlcPath;   // звуковые процессы берут тот же VLC
         UpdateStatus();
     }
 
@@ -985,6 +991,9 @@ public class MainForm : Form
         int silent = _cameras.Count(c => c.Enabled && _audio.TrackState(c.Name) == AudioTrackState.Absent);
         var text = on == 0 ? "звук выключен у всех окон" : "звук включён: " + on + " из " + _cameras.Count(c => c.Enabled);
         if (silent > 0) text += " · без звуковой дорожки: " + silent;
+
+        int failed = _audio.FailedCount();
+        if (failed > 0) text += " · не удалось запустить: " + failed;
         _audioHint.Text = text;
     }
 
@@ -1041,9 +1050,16 @@ public class MainForm : Form
     {
         if (pos < 0 || pos >= names.Count) return AudioBadgeState.Off;
         var name = names[pos];
-        if (_audio.IsBusy(name)) return AudioBadgeState.Busy;
+
+        var state = _audio.State(name);
+        if (state == AudioChannelState.Starting || state == AudioChannelState.Recovering || _audio.IsBusy(name))
+            return AudioBadgeState.Busy;
+
         if (_audio.TrackState(name) == AudioTrackState.Absent) return AudioBadgeState.NoTrack;
-        return _audio.IsOn(name) ? AudioBadgeState.On : AudioBadgeState.Off;
+
+        // Failed намеренно не показываем зелёным: звука нет
+        if (state == AudioChannelState.Playing && _audio.IsOn(name)) return AudioBadgeState.On;
+        return AudioBadgeState.Off;
     }
 
     private void LogUi(string message)
@@ -1503,6 +1519,7 @@ public class MainForm : Form
         _cfg.LogKeepDays = (int)_keepDays.Value;
         _cfg.VlcPath = (_vlcBox.Text ?? "").Trim();
         _wall.VlcPath = EffectiveVlcPath();
+        VlcLocator.Configured = _wall.VlcPath;   // звуковые процессы берут тот же VLC
         var logDir = _logDirBox.Text.Trim();
         _cfg.LogDir = (logDir.Length == 0 || string.Equals(logDir, _dir, StringComparison.OrdinalIgnoreCase)) ? "" : logDir;
         _cfg.Cameras = _cameras.ToList();

@@ -53,6 +53,9 @@ internal static class Program
         Check(loaded.AudioBadgeCorner == "top-left", "угол значка сохраняется");
         try { File.Delete(settingsPath); } catch { }
 
+        Console.WriteLine("порты звука:");
+        AudioPorts();
+
         Console.WriteLine("RTSP-проверка:");
         ProbeBasicOk();
         ProbeDigestQopAuth();
@@ -205,6 +208,74 @@ internal static class Program
         Check(WallStatusFile.TryParse(now.Ticks + "\r\nVLM=OK\r\nplaying=x\r\ntotal=2\r\n", out st)
               && st.VlmOk && st.Playing == 0 && st.Total == 2,
             "CRLF, регистр ключа и мусор в числе не ломают разбор");
+    }
+
+
+    // ============================ порты звука ============================
+
+    private static Camera Cam(string name, string url, bool on = true)
+    {
+        return new Camera { Name = name, Url = url, Enabled = on };
+    }
+
+    private static void AudioPorts()
+    {
+        using (var audio = new AudioController())
+        {
+            audio.SetBasePort(4213);
+            audio.SetCameras(new[] { Cam("A", "rtsp://192.0.2.1/a"), Cam("B", "rtsp://192.0.2.2/b") });
+
+            var map = audio.PortMap();
+            Check(map.Count == 2, "две камеры — два порта");
+            Check(map[0].Key == "A" && map[0].Value == 4213, "A получает базовый порт 4213");
+            Check(map[1].Key == "B" && map[1].Value == 4214, "B получает 4214");
+
+            // удалить A, добавить C: повторного порта быть не должно
+            audio.SetCameras(new[] { Cam("B", "rtsp://192.0.2.2/b"), Cam("C", "rtsp://192.0.2.3/c") });
+            map = audio.PortMap();
+            Check(map.Count == 2, "после замены камеры портов столько же");
+            Check(map[0].Key == "B" && map[0].Value == 4213, "B после удаления A получает 4213");
+            Check(map[1].Key == "C" && map[1].Value == 4214, "C получает 4214");
+            Check(map[0].Value != map[1].Value, "порты не повторяются");
+
+            // переставить камеры
+            audio.SetCameras(new[] { Cam("C", "rtsp://192.0.2.3/c"), Cam("B", "rtsp://192.0.2.2/b") });
+            map = audio.PortMap();
+            Check(map[0].Key == "C" && map[0].Value == 4213, "C первой — 4213");
+            Check(map[1].Key == "B" && map[1].Value == 4214, "B второй — 4214");
+
+            // смена базового порта пересчитывает порты
+            audio.SetBasePort(4313);
+            map = audio.PortMap();
+            Check(map[0].Value == 4313 && map[1].Value == 4314, "смена базового порта пересчитывает каналы");
+
+            // отключённая камера не занимает порт
+            audio.SetCameras(new[] { Cam("C", "rtsp://192.0.2.3/c"), Cam("B", "rtsp://192.0.2.2/b", false) });
+            map = audio.PortMap();
+            Check(map.Count == 1 && map[0].Key == "C" && map[0].Value == 4313,
+                "отключённая камера не занимает порт");
+
+            string problem;
+            Check(audio.PortsConsistent(out problem), "инвариант портов соблюдён");
+
+            // границы диапазона
+            audio.SetBasePort(100);
+            Check(audio.BasePort == 1024, "базовый порт не опускается ниже 1024");
+            audio.SetBasePort(65000);
+            Check(audio.BasePort == 65000, "допустимый базовый порт не обрезается");
+            audio.SetBasePort(70000);
+            Check(audio.BasePort == 65535 - AudioController.PortSpanSize,
+                "базовый порт не выходит за 65535 вместе с диапазоном");
+
+            // за 16 камер порт не должен совпасть
+            var many = new List<Camera>();
+            for (int i = 0; i < 16; i++) many.Add(Cam("K" + i, "rtsp://192.0.2.10/" + i));
+            audio.SetBasePort(4213);
+            audio.SetCameras(many);
+            var ports = audio.PortMap().Select(p => p.Value).ToList();
+            Check(ports.Count == 16 && ports.Distinct().Count() == 16, "16 камер — 16 разных портов");
+            Check(audio.PortsConsistent(out problem), "инвариант портов при 16 камерах");
+        }
     }
 
     // ============================ RTSP ============================

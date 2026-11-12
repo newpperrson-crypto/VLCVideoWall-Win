@@ -16,10 +16,12 @@ public enum AudioBadgeState
 }
 
 /// <summary>
-/// Значок звука — отдельное окно, владелец которого — окно стены (VLC).
-/// Рисуется напрямую через GDI+; WinForms-форму сделать дочерней чужому окну нельзя.
-/// Окно без TopMost: оно держится над стеной, но уходит вниз вместе с ней,
-/// когда пользователь открывает другое приложение — чужие окна не перекрываются.
+/// Значок звука — самостоятельное всплывающее окно (WS_POPUP) без TopMost,
+/// владелец — окно стены (VLC). Координаты задаются в экранной системе.
+/// Владелец держит значок над стеной; когда вперёд выходит другое приложение,
+/// значок уходит назад вместе со стеной и чужих окон не перекрывает.
+/// Дочернее окно (WS_CHILD) здесь не годится: VLC рисует видео поверх дочерних окон
+/// своего окна, значок становится невидимым.
 /// </summary>
 public sealed class AudioBadgeWindow : IDisposable
 {
@@ -171,6 +173,12 @@ public sealed class AudioBadgeWindow : IDisposable
             case WM_RBUTTONUP:
                 ReleaseCapture();
                 if (self.State == AudioBadgeState.NoTrack || self.State == AudioBadgeState.Busy) return IntPtr.Zero;
+
+                // защита от двойного срабатывания при быстрой перерисовке
+                long now = Environment.TickCount64;
+                if (now - self._lastClickTicks < 300) return IntPtr.Zero;
+                self._lastClickTicks = now;
+
                 var handler = self.Clicked;
                 if (handler != null) handler();
                 return IntPtr.Zero;
@@ -187,6 +195,16 @@ public sealed class AudioBadgeWindow : IDisposable
     }
 
     private int _x = int.MinValue, _y = int.MinValue;
+    private bool _shown = true;
+    private long _lastClickTicks;
+
+    /// <summary>Скрыть значок, когда окно стены свёрнуто или невидимо.</summary>
+    public void SetVisible(bool visible)
+    {
+        if (_shown == visible || Handle == IntPtr.Zero) return;
+        _shown = visible;
+        ShowWindow(Handle, visible ? 8 : 0);   // SW_SHOWNA / SW_HIDE
+    }
 
     public void Move(int x, int y)
     {
@@ -219,6 +237,9 @@ public sealed class AudioBadgeWindow : IDisposable
 
     [DllImport("user32.dll")]
     private static extern bool InvalidateRect(IntPtr hWnd, IntPtr rect, bool erase);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int cmd);
 
     [DllImport("user32.dll")]
     private static extern IntPtr SetCapture(IntPtr hWnd);

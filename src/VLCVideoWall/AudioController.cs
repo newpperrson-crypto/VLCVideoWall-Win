@@ -6,7 +6,7 @@ using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
-using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace VLCVideoWall;
@@ -19,11 +19,25 @@ public enum AudioTrackState
     Absent      // только видео
 }
 
+/// <summary>Состояние звука канала.</summary>
+public enum AudioChannelState
+{
+    Off,         // звук камеры выключен
+    Starting,    // процесс запускается
+    Playing,     // процесс работает
+    Recovering,  // процесс упал, идёт восстановление с задержкой
+    Failed       // восстановление исчерпало попытки
+}
+
 /// <summary>
 /// Звук стены. VLC собирает мозаику только из видео (у mosaic-bridge нет аудиопараметров),
 /// поэтому каждая включённая камера получает собственный процесс VLC без видео.
 /// Процессами управляет приложение: так переключение мгновенное, а сторож не занят
 /// ожиданием команд в своём цикле опроса.
+///
+/// Порты закрепляет только AssignPortsLocked(): порт = BasePort + номер окна камеры.
+/// Поэтому после добавления, удаления или перестановки камер повторов быть не может,
+/// а смена BasePort пересчитывает порты всем каналам.
 /// </summary>
 public sealed class AudioController : IDisposable
 {
@@ -31,44 +45,83 @@ public sealed class AudioController : IDisposable
     {
         public string Name = "";
         public string Url = "";
+        public int Order;              // номер окна в текущем списке камер
         public int Port;
         public string Password = "";
         public Process Proc;
-        public bool On;                 // пользователь включил звук этой камеры
-        public bool Busy;               // идёт переключение
+        public bool On;                // пользователь включил звук этой камеры
+        public bool Starting;          // процесс запускается прямо сейчас
+        public bool VolumeDirty;       // нужно применить громкость
+        public int Fails;              // подряд неудачных запусков
+        public DateTime NextTry = DateTime.MinValue;
         public AudioTrackState Track = AudioTrackState.Unknown;
+        public AudioChannelState State = AudioChannelState.Off;
     }
 
-    /// <summary>Первый порт звуковых процессов (задаётся в настройках портов).</summary>
-    public int BasePort { get; set; } = 4213;
+    private const int PortSpan = 16;               // порты BasePort … BasePort+15
+    private static readonly int[] BackoffSeconds = { 2, 5, 15, 45, 120 };
+    private const int MaxFails = 5;
+
     private readonly Dictionary<string, Channel> _channels = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _sync = new();
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(2) };
-    private VlcLocator _vlc = new();
+    private readonly CancellationTokenSource _volumeCts = new();
+    private readonly Task _volumeLoop;
+    private int _basePort = 4213;
+    private bool _disposed;
+
+    public AudioController()
+    {
+        _volumeLoop = Task.Run(() => VolumeLoopAsync(_volumeCts.Token));
+    }
 
     public bool Enabled { get; set; }          // общая поддержка звука
     public int Volume { get; set; } = 80;      // 0..100
     public string LastError { get; private set; } = "";
 
-    public event Action Changed;               // что-то изменилось — перерисовать значки
+    /// <summary>Сколько портов занимает звук.</summary>
+    public static int PortSpanSize { get { return PortSpan; } }
+
+    /// <summary>Первый порт звуковых процессов. Смена пересчитывает порты каналов.</summary>
+    public int BasePort
+    {
+        get { lock (_sync) return _basePort; }
+        set { SetBasePort(value); }
+    }
+
+    public event Action Changed;
 
     public void Dispose()
     {
-        StopAll();
+        _disposed = true;
+        lock (_sync)
+        {
+            foreach (var ch in _channels.Values) KillLocked(ch);
+        }
+        try { _volumeCts.Cancel(); } catch { }
+        try { _volumeLoop.Wait(800); } catch { }
+        try { _volumeCts.Dispose(); } catch { }
         _http.Dispose();
     }
 
-    /// <summary>Актуальный список камер: имена, адреса и порядок окон.</summary>
+    // ---------------------------------------------------------------- камеры и порты
+
+    /// <summary>
+    /// Актуальный список камер. Пересчитывает порты по текущему порядку окон и
+    /// перезапускает те живые каналы, у которых сменился порт.
+    /// </summary>
     public void SetCameras(IEnumerable<Camera> cameras)
     {
+        var list = cameras.Where(c => c.Enabled).ToList();
+        List<Channel> restart = new List<Channel>();
+
         lock (_sync)
         {
-            var list = cameras.Where(c => c.Enabled).ToList();
             var keep = new HashSet<string>(list.Select(c => c.Name), StringComparer.OrdinalIgnoreCase);
-
             foreach (var gone in _channels.Where(kv => !keep.Contains(kv.Key)).Select(kv => kv.Key).ToList())
             {
-                KillChannel(_channels[gone]);
+                var ch = _channels[gone];
+                KillLocked(ch);
                 _channels.Remove(gone);
             }
 
@@ -81,15 +134,83 @@ public sealed class AudioController : IDisposable
                     ch = new Channel
                     {
                         Name = cam.Name,
-                        Port = BasePort + i,
                         Password = Guid.NewGuid().ToString("N").Substring(0, 16)
                     };
                     _channels[cam.Name] = ch;
                 }
+                ch.Order = i;
                 ch.Url = cam.Url;
             }
+
+            AssignPortsLocked(restart);
+        }
+
+        foreach (var ch in restart) RestartChannel(ch);
+    }
+
+    /// <summary>Сменить базовый порт: порты пересчитываются, живые каналы перезапускаются.</summary>
+    public void SetBasePort(int port)
+    {
+        int clamped = Math.Clamp(port, 1024, 65535 - PortSpan);
+        List<Channel> restart = new List<Channel>();
+        lock (_sync)
+        {
+            if (_basePort == clamped) return;
+            _basePort = clamped;
+            AssignPortsLocked(restart);
+        }
+        foreach (var ch in restart) RestartChannel(ch);
+    }
+
+    /// <summary>Единственное место, где назначаются порты. Требует _sync.</summary>
+    private void AssignPortsLocked(List<Channel> restart)
+    {
+        foreach (var ch in _channels.Values)
+        {
+            int newPort = _basePort + ch.Order;
+            if (ch.Port == newPort) continue;
+            ch.Port = newPort;
+            if (ch.Proc != null) restart.Add(ch);
         }
     }
+
+    /// <summary>Карта «камера → порт» (для журнала и проверок).</summary>
+    public List<KeyValuePair<string, int>> PortMap()
+    {
+        lock (_sync)
+        {
+            return _channels.Values
+                .OrderBy(c => c.Order)
+                .Select(c => new KeyValuePair<string, int>(c.Name, c.Port))
+                .ToList();
+        }
+    }
+
+    /// <summary>Инвариант: порты уникальны и лежат в диапазоне звука.</summary>
+    public bool PortsConsistent(out string problem)
+    {
+        problem = null;
+        lock (_sync)
+        {
+            var ports = _channels.Values.Select(c => c.Port).ToList();
+            if (ports.Distinct().Count() != ports.Count)
+            {
+                problem = "повторяющиеся порты звука";
+                return false;
+            }
+            foreach (var ch in _channels.Values)
+            {
+                if (ch.Port < _basePort || ch.Port >= _basePort + PortSpan)
+                {
+                    problem = "порт " + ch.Port + " вне диапазона звука";
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // ---------------------------------------------------------------- состояние каналов
 
     public bool IsOn(string name)
     {
@@ -98,7 +219,21 @@ public sealed class AudioController : IDisposable
 
     public bool IsBusy(string name)
     {
-        lock (_sync) { Channel ch; return _channels.TryGetValue(name, out ch) && ch.Busy; }
+        lock (_sync)
+        {
+            Channel ch;
+            if (!_channels.TryGetValue(name, out ch)) return false;
+            return ch.Starting || ch.State == AudioChannelState.Starting || ch.State == AudioChannelState.Recovering;
+        }
+    }
+
+    public AudioChannelState State(string name)
+    {
+        lock (_sync)
+        {
+            Channel ch;
+            return _channels.TryGetValue(name, out ch) ? ch.State : AudioChannelState.Off;
+        }
     }
 
     public AudioTrackState TrackState(string name)
@@ -106,13 +241,16 @@ public sealed class AudioController : IDisposable
         lock (_sync) { Channel ch; return _channels.TryGetValue(name, out ch) ? ch.Track : AudioTrackState.Unknown; }
     }
 
-    /// <summary>Включённые камеры — для сохранения в настройках.</summary>
     public List<string> EnabledChannels()
     {
         lock (_sync) { return _channels.Values.Where(c => c.On).Select(c => c.Name).ToList(); }
     }
 
-    /// <summary>Вернуть сохранённые состояния (до запуска стены они только помечают значки).</summary>
+    public int FailedCount()
+    {
+        lock (_sync) { return _channels.Values.Count(c => c.State == AudioChannelState.Failed); }
+    }
+
     public void RestoreStates(IEnumerable<string> enabled)
     {
         var set = new HashSet<string>(enabled ?? Enumerable.Empty<string>(), StringComparer.OrdinalIgnoreCase);
@@ -121,8 +259,20 @@ public sealed class AudioController : IDisposable
             foreach (var ch in _channels.Values)
             {
                 ch.On = set.Contains(ch.Name);
-                ch.Busy = false;
+                ch.Starting = false;
+                ch.Fails = 0;
+                ch.NextTry = DateTime.MinValue;
+                ch.State = AudioChannelState.Off;
             }
+        }
+    }
+
+    /// <summary>Забыть результаты проверки дорожек (стена остановлена — данные устарели).</summary>
+    public void ResetTracks()
+    {
+        lock (_sync)
+        {
+            foreach (var ch in _channels.Values) ch.Track = AudioTrackState.Unknown;
         }
     }
 
@@ -144,20 +294,12 @@ public sealed class AudioController : IDisposable
                     Channel target;
                     if (_channels.TryGetValue(name, out target)) target.Track = state;
                 }
-                var handler = Changed;
-                if (handler != null) handler();
+                RaiseChanged();
             });
         }
     }
 
-    /// <summary>Забыть результаты проверки дорожек (стена остановлена — данные устарели).</summary>
-    public void ResetTracks()
-    {
-        lock (_sync)
-        {
-            foreach (var ch in _channels.Values) ch.Track = AudioTrackState.Unknown;
-        }
-    }
+    // ---------------------------------------------------------------- включение и выключение
 
     /// <summary>
     /// Переключить звук камеры. Возвращает false, если переключать нечего.
@@ -171,33 +313,23 @@ public sealed class AudioController : IDisposable
             Channel ch;
             if (!_channels.TryGetValue(name, out ch)) return false;
             if (startProcess && ch.Track == AudioTrackState.Absent) return false;   // дорожки нет
-            if (ch.Busy) return false;
+            if (ch.Starting || ch.State == AudioChannelState.Starting || ch.State == AudioChannelState.Recovering)
+                return false;
+
             wantOn = !ch.On;
             ch.On = wantOn;
-            ch.Busy = startProcess;
+            ch.Fails = 0;
+            ch.NextTry = DateTime.MinValue;
+            ch.State = wantOn ? AudioChannelState.Starting : AudioChannelState.Off;
+            if (startProcess && wantOn) ch.Starting = true;
         }
 
-        if (!startProcess)
-        {
-            var quiet = Changed;
-            if (quiet != null) quiet();
-            return true;
-        }
+        RaiseChanged();
 
-        var raiser = Changed;
-        if (raiser != null) raiser();
+        if (!startProcess) return true;
 
-        Task.Run(() =>
-        {
-            if (wantOn) StartChannel(name); else StopChannel(name);
-            lock (_sync)
-            {
-                Channel ch;
-                if (_channels.TryGetValue(name, out ch)) ch.Busy = false;
-            }
-            var done = Changed;
-            if (done != null) done();
-        });
+        if (wantOn) Task.Run(() => StartChannel(name));
+        else Task.Run(() => { StopChannel(name); RaiseChanged(); });
         return true;
     }
 
@@ -205,35 +337,143 @@ public sealed class AudioController : IDisposable
     public void StartEnabled()
     {
         if (!Enabled) return;
-        List<string> names;
-        lock (_sync) names = _channels.Values.Where(c => c.On).Select(c => c.Name).ToList();
-        foreach (var n in names) StartChannel(n);
+        var start = new List<string>();
+        lock (_sync)
+        {
+            foreach (var ch in _channels.Values)
+            {
+                if (!ch.On) continue;
+                if (ch.Starting || ch.State == AudioChannelState.Playing) continue;
+                if (ch.Proc != null && !SafeExited(ch.Proc)) continue;
+                ch.Starting = true;
+                ch.State = AudioChannelState.Starting;
+                start.Add(ch.Name);
+            }
+        }
+        foreach (var n in start) Task.Run(() => StartChannel(n));
     }
+
+    /// <summary>
+    /// Периодический контроль: поднимает каналы, которые должны играть, но процесс пропал.
+    /// Отличает намеренное выключение (On=false) от аварии, делает backoff с ограничением попыток.
+    /// </summary>
+    public void Tick()
+    {
+        if (_disposed) return;
+
+        var start = new List<string>();
+        bool changed = false;
+
+        lock (_sync)
+        {
+            foreach (var ch in _channels.Values)
+            {
+                bool alive = ch.Proc != null && !SafeExited(ch.Proc);
+                if (alive)
+                {
+                    if (ch.State != AudioChannelState.Playing && ch.On)
+                    {
+                        ch.State = AudioChannelState.Playing;
+                        changed = true;
+                    }
+                    continue;
+                }
+
+                if (!ch.On) continue;                          // выключено пользователем — не поднимаем
+                if (!Enabled) continue;                        // звук выключен целиком
+                if (ch.Track == AudioTrackState.Absent) continue;
+                if (ch.Starting) continue;
+
+                if (ch.Proc != null) { KillLocked(ch); ch.Proc = null; }
+
+                if (ch.State == AudioChannelState.Playing || ch.State == AudioChannelState.Starting)
+                {
+                    // был живым и пропал — восстановление
+                    ch.Fails++;
+                    changed = true;
+                    if (ch.Fails > MaxFails)
+                    {
+                        ch.State = AudioChannelState.Failed;
+                        continue;
+                    }
+                    int delay = BackoffSeconds[Math.Min(ch.Fails - 1, BackoffSeconds.Length - 1)];
+                    ch.NextTry = DateTime.UtcNow.AddSeconds(delay);
+                    ch.State = AudioChannelState.Recovering;
+                    continue;
+                }
+
+                if (ch.State == AudioChannelState.Failed) continue;
+                if (DateTime.UtcNow < ch.NextTry) continue;
+
+                ch.Starting = true;
+                ch.State = AudioChannelState.Starting;
+                changed = true;
+                start.Add(ch.Name);
+            }
+        }
+
+        if (changed) RaiseChanged();
+        foreach (var n in start) Task.Run(() => StartChannel(n));
+    }
+
+    // ---------------------------------------------------------------- процессы
 
     private void StartChannel(string name)
     {
         Channel ch;
+        int port;
+        string url, password;
+
         lock (_sync)
         {
             if (!_channels.TryGetValue(name, out ch)) return;
-            if (ch.Track == AudioTrackState.Absent) return;
-            if (ch.Proc != null && !ch.Proc.HasExited) { ApplyVolume(ch); return; }
+            if (_disposed || !Enabled || !ch.On)
+            {
+                ch.Starting = false;
+                ch.State = AudioChannelState.Off;
+                return;
+            }
+            if (ch.Track == AudioTrackState.Absent)
+            {
+                ch.Starting = false;
+                ch.State = AudioChannelState.Off;
+                return;
+            }
+            if (ch.Proc != null && !SafeExited(ch.Proc))
+            {
+                ch.Starting = false;
+                ch.State = AudioChannelState.Playing;
+                ch.VolumeDirty = true;
+                return;
+            }
+
+            port = ch.Port;
+            url = ch.Url;
+            password = ch.Password;
         }
 
         string exe;
         if (!VlcLocator.TryResolve(out exe))
         {
-            LastError = "VLC не найден";
+            FailStart(name, "VLC не найден");
             return;
         }
 
-        int vol = (int)(Math.Clamp(Volume, 0, 100) * 256 / 100.0);
+        // адрес камеры (с логином и паролем) кладём в файл плейлиста:
+        // в командной строке процесса секретов не остаётся
+        var playlist = AudioPlaylist.Write(name, url);
+        if (playlist == null)
+        {
+            FailStart(name, "не удалось подготовить файл потока");
+            return;
+        }
+
         var args = new StringBuilder();
         args.Append("-I dummy --no-video --no-video-title-show --rtsp-tcp ");
-        args.Append("--volume ").Append(vol).Append(' ');
-        args.Append("--extraintf http --http-host 127.0.0.1 --http-port ").Append(ch.Port).Append(' ');
-        args.Append("--http-password ").Append(ch.Password).Append(' ');
-        args.Append('"').Append(ch.Url).Append('"');
+        args.Append("--volume ").Append(VolumeToVlc(Volume)).Append(' ');
+        args.Append("--extraintf http --http-host 127.0.0.1 --http-port ").Append(port).Append(' ');
+        args.Append("--http-password ").Append(password).Append(' ');
+        args.Append('"').Append(playlist).Append('"');
 
         try
         {
@@ -244,122 +484,237 @@ public sealed class AudioController : IDisposable
                 WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory
             };
             var proc = Process.Start(psi);
-            lock (_sync) ch.Proc = proc;
+
+            lock (_sync)
+            {
+                if (!_channels.TryGetValue(name, out ch) || (!ch.On && !_disposed))
+                {
+                    try { proc.Kill(); } catch { }
+                    try { proc.Dispose(); } catch { }
+                    AudioPlaylist.Delete(name);
+                    return;
+                }
+                ch.Proc = proc;
+                ch.Starting = false;
+                ch.Fails = 0;
+                ch.NextTry = DateTime.MinValue;
+                ch.State = AudioChannelState.Playing;
+                ch.VolumeDirty = true;
+            }
+            LastError = "";
+            RaiseChanged();
         }
         catch (Exception e)
         {
-            LastError = "не удалось запустить звук: " + e.Message;
+            AudioPlaylist.Delete(name);
+            FailStart(name, "не удалось запустить звук: " + e.Message);
         }
+    }
+
+    private void FailStart(string name, string error)
+    {
+        if (!string.IsNullOrEmpty(error)) LastError = error;
+        lock (_sync)
+        {
+            Channel ch;
+            if (!_channels.TryGetValue(name, out ch)) return;
+            ch.Starting = false;
+            ch.Fails++;
+            if (ch.Fails > MaxFails)
+            {
+                ch.State = AudioChannelState.Failed;
+            }
+            else
+            {
+                int delay = BackoffSeconds[Math.Min(ch.Fails - 1, BackoffSeconds.Length - 1)];
+                ch.NextTry = DateTime.UtcNow.AddSeconds(delay);
+                ch.State = AudioChannelState.Recovering;
+            }
+        }
+        RaiseChanged();
     }
 
     private void StopChannel(string name)
     {
-        Channel ch;
         lock (_sync)
         {
+            Channel ch;
             if (!_channels.TryGetValue(name, out ch)) return;
-            KillChannel(ch);
+            KillLocked(ch);
+            ch.Starting = false;
+            ch.State = AudioChannelState.Off;
         }
+        AudioPlaylist.Delete(name);
     }
 
-    private void KillChannel(Channel ch)
+    /// <summary>Смена порта/адреса у работающего канала: гасим старый, поднимаем новый.</summary>
+    private void RestartChannel(Channel ch)
     {
-        try
+        string name = ch.Name;
+        lock (_sync)
         {
-            if (ch.Proc != null && !ch.Proc.HasExited) ch.Proc.Kill();
+            Channel current;
+            if (!_channels.TryGetValue(name, out current) || !ReferenceEquals(current, ch)) return;
+            ch.Starting = true;
+            ch.State = AudioChannelState.Starting;
+            KillLocked(ch);
         }
-        catch { }
-        try { if (ch.Proc != null) ch.Proc.Dispose(); } catch { }
-        ch.Proc = null;
-    }
+        AudioPlaylist.Delete(name);
+        RaiseChanged();
 
-    /// <summary>Громкость. Уже запущенные потоки получают новое значение сразу.</summary>
-    public void ApplyVolumeAll()
-    {
-        List<Channel> list;
-        lock (_sync) list = _channels.Values.ToList();
-        foreach (var ch in list) ApplyVolume(ch);
-    }
-
-    private void ApplyVolume(Channel ch)
-    {
-        if (ch.Proc == null || ch.Proc.HasExited) return;
-        int val = ch.On ? (int)(Math.Clamp(Volume, 0, 100) * 256 / 100.0) : 0;
-        try
+        Task.Run(() =>
         {
-            var url = "http://127.0.0.1:" + ch.Port + "/requests/status.xml?command=volume&val=" + val;
-            using (var req = new HttpRequestMessage(HttpMethod.Get, url))
+            lock (_sync)
             {
-                var auth = Convert.ToBase64String(Encoding.UTF8.GetBytes(":" + ch.Password));
-                req.Headers.Authorization = new AuthenticationHeaderValue("Basic", auth);
-                _http.SendAsync(req).GetAwaiter().GetResult().Dispose();
+                Channel current;
+                if (!_channels.TryGetValue(name, out current)) return;
+                current.Starting = false;
+                if (_disposed || !Enabled || !current.On)
+                {
+                    current.State = AudioChannelState.Off;
+                    return;
+                }
+            }
+            StartChannel(name);
+        });
+    }
+
+    private void KillLocked(Channel ch)
+    {
+        var proc = ch.Proc;
+        ch.Proc = null;
+        ch.VolumeDirty = false;
+        if (proc == null) return;
+        try
+        {
+            if (!SafeExited(proc))
+            {
+                proc.Kill();
+                try { proc.WaitForExit(1500); } catch { }
             }
         }
         catch { }
+        try { proc.Dispose(); } catch { }
     }
 
     public void StopAll()
     {
-        List<Channel> list;
-        lock (_sync) list = _channels.Values.ToList();
-        foreach (var ch in list)
+        var list = new List<Channel>();
+        lock (_sync)
         {
-            lock (_sync) KillChannel(ch);
+            foreach (var ch in _channels.Values)
+            {
+                // настройка пользователя (On) сохраняется: остановка стены не должна её терять,
+                // иначе после следующего запуска звук не поднимется
+                KillLocked(ch);
+                ch.Starting = false;
+                ch.Fails = 0;
+                ch.NextTry = DateTime.MinValue;
+                ch.State = AudioChannelState.Off;
+                list.Add(ch);
+            }
+        }
+        AudioPlaylist.DeleteAll();
+    }
+
+    public int PlayingCount()
+    {
+        lock (_sync) return _channels.Values.Count(c => c.Proc != null && !SafeExited(c.Proc));
+    }
+
+    private static bool SafeExited(Process p)
+    {
+        try { return p.HasExited; } catch { return true; }
+    }
+
+    // ---------------------------------------------------------------- громкость
+
+    private static int VolumeToVlc(int percent)
+    {
+        return (int)(Math.Clamp(percent, 0, 100) * 256 / 100.0);
+    }
+
+    /// <summary>Громкость: все запущенные потоки получат последнее значение.</summary>
+    public void ApplyVolumeAll()
+    {
+        lock (_sync)
+        {
+            foreach (var ch in _channels.Values) ch.VolumeDirty = true;
         }
     }
 
-    /// <summary>Сколько камер сейчас реально звучит.</summary>
-    public int PlayingCount()
+    /// <summary>
+    /// Отправка громкости в фоне: интерфейс не блокируется, очередь запросов не растёт —
+    /// пока запрос в пути, новое значение только помечается и уходит следующим.
+    /// </summary>
+    private async Task VolumeLoopAsync(CancellationToken ct)
     {
-        lock (_sync)
-            return _channels.Values.Count(c => c.Proc != null && !c.Proc.HasExited);
-    }
-}
-
-/// <summary>Минимальный поиск vlc.exe: конфиг стены, потом типовые пути.</summary>
-sealed class VlcLocator
-{
-    public static string Configured = "";
-
-    public static bool TryResolve(out string path)
-    {
-        foreach (var candidate in Candidates())
+        while (!ct.IsCancellationRequested)
         {
             try
             {
-                if (!string.IsNullOrWhiteSpace(candidate) && File.Exists(candidate))
+                var todo = new List<Tuple<Channel, int>>();
+                lock (_sync)
                 {
-                    path = candidate;
-                    return true;
+                    foreach (var ch in _channels.Values)
+                    {
+                        if (!ch.VolumeDirty) continue;
+                        if (ch.Proc == null || SafeExited(ch.Proc)) { ch.VolumeDirty = false; continue; }
+                        ch.VolumeDirty = false;
+                        todo.Add(Tuple.Create(ch, VolumeToVlc(Volume)));
+                    }
                 }
+
+                foreach (var item in todo)
+                {
+                    if (ct.IsCancellationRequested) break;
+                    await SendVolumeAsync(item.Item1, item.Item2, ct).ConfigureAwait(false);
+                }
+
+                await Task.Delay(120, ct).ConfigureAwait(false);
             }
-            catch { }
+            catch (OperationCanceledException) { break; }
+            catch
+            {
+                try { await Task.Delay(300, ct).ConfigureAwait(false); } catch { break; }
+            }
         }
-        path = "";
-        return false;
     }
 
-    private static IEnumerable<string> Candidates()
+    private async Task SendVolumeAsync(Channel ch, int value, CancellationToken ct)
     {
-        if (!string.IsNullOrWhiteSpace(Configured)) yield return Configured.Trim().Trim('"');
+        int port;
+        string password;
+        lock (_sync)
+        {
+            if (ch.Proc == null || SafeExited(ch.Proc)) return;
+            port = ch.Port;
+            password = ch.Password;
+        }
 
-        var pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-        yield return Path.Combine(pf, "VideoLAN", "VLC", "vlc.exe");
-
-        var pf86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
-        yield return Path.Combine(pf86, "VideoLAN", "VLC", "vlc.exe");
-
-        string found = null;
+        var url = "http://127.0.0.1:" + port + "/requests/status.xml?command=volume&val=" + value;
         try
         {
-            var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\VideoLAN\VLC");
-            if (key != null)
+            using (var req = new HttpRequestMessage(HttpMethod.Get, url))
             {
-                var install = key.GetValue("InstallDir") as string;
-                if (!string.IsNullOrWhiteSpace(install)) found = Path.Combine(install, "vlc.exe");
+                var auth = Convert.ToBase64String(Encoding.UTF8.GetBytes(":" + password));
+                req.Headers.Authorization = new AuthenticationHeaderValue("Basic", auth);
+                using (var resp = await _http.SendAsync(req, ct).ConfigureAwait(false))
+                {
+                }
             }
         }
-        catch { }
-        if (found != null) yield return found;
+        catch (OperationCanceledException) { }
+        catch (Exception e)
+        {
+            LastError = "громкость: " + e.Message;
+        }
+    }
+
+    private void RaiseChanged()
+    {
+        var handler = Changed;
+        if (handler == null) return;
+        try { handler(); } catch { }
     }
 }

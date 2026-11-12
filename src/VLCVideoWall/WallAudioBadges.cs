@@ -7,8 +7,9 @@ using System.Runtime.InteropServices;
 namespace VLCVideoWall;
 
 /// <summary>
-/// Значки звука поверх всех плиток стены. Каждый значок — дочернее окно окна VLC:
-/// он движется и обрезается вместе со стеной и не перекрывает чужие окна.
+/// Значки звука поверх всех плиток стены. Каждый значок — всплывающее окно с владельцем
+/// «окно стены» и экранными координатами; при свёрнутой или невидимой стене значки
+/// скрываются, чтобы не оставаться кликабельными поверх чужих программ.
 /// </summary>
 public sealed class WallAudioBadges : IDisposable
 {
@@ -17,6 +18,12 @@ public sealed class WallAudioBadges : IDisposable
 
     [DllImport("user32.dll")]
     private static extern bool IsWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
 
     private readonly Dictionary<int, AudioBadgeWindow> _badges = new Dictionary<int, AudioBadgeWindow>();
     private IntPtr _parent = IntPtr.Zero;
@@ -42,6 +49,9 @@ public sealed class WallAudioBadges : IDisposable
             HideAll();
             return;
         }
+
+        // стена свёрнута или скрыта — значки не показываем
+        bool ownerVisible = IsWindowVisible(parent) && !IsIconic(parent);
 
         if (parent != _parent) { HideAll(); _parent = parent; }
 
@@ -81,6 +91,7 @@ public sealed class WallAudioBadges : IDisposable
             if (x + Size > tile.Right) x = Math.Max(tile.Left, tile.Right - Size);
             if (y + Size > tile.Bottom) y = Math.Max(tile.Top, tile.Bottom - Size);
             badge.Move(x, y);
+            badge.SetVisible(ownerVisible);
         }
     }
 
