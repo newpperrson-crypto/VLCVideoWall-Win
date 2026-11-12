@@ -135,11 +135,7 @@ public class WallPreview : Control
                     g.FillEllipse(Brushes.White, box.X + (int)(size * 0.54) + i * (int)(size * 0.11),
                                   box.Y + (int)(size * 0.46), (int)(size * 0.06), (int)(size * 0.06));
             }
-            else
-            {
-                g.DrawLine(pen, box.X + (int)(size * 0.6), box.Y + (int)(size * 0.34),
-                                box.X + (int)(size * 0.82), box.Y + (int)(size * 0.66));
-            }
+            // выключен: только динамик, без перечёркивания
         }
     }
 

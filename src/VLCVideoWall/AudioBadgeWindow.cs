@@ -285,10 +285,7 @@ public sealed class AudioBadgeWindow : IDisposable
                     g.FillEllipse(Brushes.White, (int)(size * 0.54) + i * (int)(size * 0.11),
                                   (int)(size * 0.46), (int)(size * 0.06), (int)(size * 0.06));
             }
-            else
-            {
-                g.DrawLine(pen, (int)(size * 0.55), (int)(size * 0.34), (int)(size * 0.77), (int)(size * 0.62));
-            }
+            // выключен: только динамик, без перечёркивания
         }
     }
 
