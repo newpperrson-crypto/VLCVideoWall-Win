@@ -1,0 +1,38 @@
+name: сборка
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Сборка
+        run: dotnet build src/VLCVideoWall/VLCVideoWall.csproj -c Release --nologo
+
+      - name: Тесты
+        run: dotnet run --project tests/VLCVideoWall.Tests/VLCVideoWall.Tests.csproj -c Release
+
+      - name: Публикация одним файлом
+        run: dotnet publish src/VLCVideoWall/VLCVideoWall.csproj -c Release -o dist --nologo
+
+      - name: Публикация артефакта
+        uses: actions/upload-artifact@v4
+        with:
+          name: VLCVideoWall-win-x64
+          path: |
+            dist/VLCVideoWall.exe
+            watchdog.ps1
+            config/Mosaic.conf.example
+            config/README.txt
+            LICENSE
+          if-no-files-found: error

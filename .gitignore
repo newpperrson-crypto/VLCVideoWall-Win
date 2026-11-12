@@ -1,0 +1,35 @@
+# --- результаты сборки --------------------------------------------------
+[Bb]in/
+[Oo]bj/
+[Pp]ublish/
+dist/
+*.user
+*.suo
+.vs/
+
+# --- рабочие данные: настоящий конфиг и его следы не коммитим -----------
+# В Mosaic.conf, его копиях и Mosaic.vlm хранятся логин и пароль камер.
+Mosaic.conf
+Mosaic.conf.*
+Mosaic*.bak
+Mosaic.vlm
+Mosaic.active.vlm
+*.bak
+
+# настройки окна: старые и текущие имена
+VLCVideoWall.settings.json
+VideoWall.settings.json
+
+# служебные файлы запущенной стены
+vlc.pid
+watchdog.heartbeat
+watchdog.status
+stop.flag
+*.log
+bg_*.jpg
+
+# --- мусор операционной системы и редакторов ---------------------------
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp

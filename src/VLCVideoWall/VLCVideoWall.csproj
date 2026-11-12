@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>VLCVideoWall</AssemblyName>
+    <RootNamespace>VLCVideoWall</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <Version>1.2.7</Version>
+    <AssemblyVersion>1.2.7.0</AssemblyVersion>
+    <FileVersion>1.2.7.0</FileVersion>
+    <Product>VLC VideoWall</Product>
+    <Description>Видеостена для Windows: мозаика RTSP-камер на VLC с самовосстановлением каналов.</Description>
+    <Company>VLCVideoWall-Win contributors</Company>
+    <Copyright>MIT licensed</Copyright>
+    <RepositoryUrl>https://github.com/newpperrson-crypto/VLCVideoWall-Win</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+
+    <!-- публикуем самодостаточный файл: на целевой машине не нужен ни .NET, ни VC++ -->
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>none</DebugType>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <InvariantGlobalization>false</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- иконка окна и трея: берётся из этого же .ico, поэтому не размывается -->
+    <EmbeddedResource Include="app.ico" LogicalName="VLCVideoWall.app.ico" />
+  </ItemGroup>
+
+</Project>
