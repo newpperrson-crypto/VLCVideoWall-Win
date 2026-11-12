@@ -9,6 +9,11 @@
 #
 # Запускается из video_start.vbs (без окна) или video_start.bat (с окном и логом).
 
+param(
+    [int]$WallPort = 0,    # локальный HTTP-порт VLC стены (0 = из Mosaic.conf или 4212)
+    [int]$GuardPort = 0    # локальный порт сторожа (0 = из Mosaic.conf или 42130)
+)
+
 $ErrorActionPreference = 'Continue'
 
 $BASE = $PSScriptRoot
@@ -36,7 +41,11 @@ $HANG_POLLS        = 8     # нет ответа HTTP ~40 c -> считаем, �
 $VLC_RESTART_DELAY = 5
 $KILL_WAIT_MS = 8000      # сколько ждать завершения процесса после Kill
 $KILL_RETRY_DELAY = 3     # пауза между попытками принудительного завершения
-$LOCK_PORT         = 42130 # защита от второго экземпляра сторожа
+$LOCK_PORT         = 42130 # защита от второго экземпляра сторожа (переопределяется параметром)
+
+# порты из параметров запуска: приложение передаёт их при старте сторожа
+if ($WallPort -ge 1024 -and $WallPort -le 65535) { $HTTP_PORT = $WallPort }
+if ($GuardPort -ge 1024 -and $GuardPort -le 65535) { $LOCK_PORT = $GuardPort }
 $PROBE_OK_INTERVAL   = 5    # опрос камеры, когда она не отвечает по сети
 $PROBE_SLOW_INTERVAL = 60   # порт открыт, но RTSP молчит
 $PROBE_AUTH_INTERVAL = 120  # 401/403: не чаще раза в 2 минуты, иначе камера банит IP
@@ -137,6 +146,8 @@ function Read-MosaicConf([string]$path) {
     $canvasW = 1920
     $canvasH = 1080
     $windowed = $false
+    $portWall = 0
+    $portGuard = 0
     $cams = @()
     foreach ($line in (Get-Content -LiteralPath $path -Encoding UTF8)) {
         $t = $line.Trim()
@@ -147,6 +158,10 @@ function Read-MosaicConf([string]$path) {
         } elseif ($t -match '^canvas\s*=\s*(\d+)\s*[xхX×]\s*(\d+)') {
             $canvasW = [int]$Matches[1]
             $canvasH = [int]$Matches[2]
+        } elseif ($t -match '^port_wall\s*=\s*(\d+)') {
+            $portWall = [int]$Matches[1]
+        } elseif ($t -match '^port_guard\s*=\s*(\d+)') {
+            $portGuard = [int]$Matches[1]
         } elseif ($t -match '^windowed\s*=\s*(\S+)') {
             # стена в окне размером с полотно; по умолчанию выключено
             $windowed = @('yes', 'on', 'true', '1', 'да') -contains $Matches[1].ToLowerInvariant().Trim('"')
@@ -168,6 +183,7 @@ function Read-MosaicConf([string]$path) {
         Layout = $layout; Cams = @($cams)
         CanvasW = $canvasW; CanvasH = $canvasH; BgFile = $bgFile
         Windowed = $windowed
+        PortWall = $portWall; PortGuard = $portGuard
     }
 }
 
@@ -761,6 +777,12 @@ function Invoke-Watchdog {
     Write-Log ('адреса: {0}' -f $addr)
 
     $script:CAMERAS = @($channels)
+
+    # порты: приоритет у параметров запуска, иначе из Mosaic.conf
+    if (($WallPort -lt 1024 -or $WallPort -gt 65535) -and $scene.PortWall -ge 1024 -and $scene.PortWall -le 65535) {
+        $script:HTTP_PORT = $scene.PortWall
+        Write-Log ('порт стены из Mosaic.conf: {0}' -f $script:HTTP_PORT)
+    }
 
     $proc = $null
     $graceUntil = 0.0

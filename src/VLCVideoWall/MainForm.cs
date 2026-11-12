@@ -44,6 +44,9 @@ public class MainForm : Form
     private CheckBox _chkAudio;
     private NumericUpDown _numAudioVolume;
     private Label _audioHint;
+    private Label _portHint;
+    private ComboBox _cmbBadgeCorner;
+    private NumericUpDown _numPortWall, _numPortGuard, _numPortAudio;
 
     // --- вкладка «Камеры и сетка»
     private ComboBox _preset;
@@ -531,7 +534,32 @@ public class MainForm : Form
         _audioHint = new Label { AutoSize = true, ForeColor = Color.FromArgb(93, 107, 127), Margin = new Padding(18, 8, 0, 0) };
         audioRow.Controls.Add(_audioHint);
 
-        fl.Controls.AddRange(new Control[] { vlcPanel, _chkAutoApp, _chkAutoWall, _chkTrayMin, _chkTrayClose, _chkTopMost, audioRow, hint });
+        // положение значка звука
+        var cornerRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 6, 0, 0) };
+        cornerRow.Controls.Add(new Label { Text = "значок звука", AutoSize = true, Margin = new Padding(0, 8, 8, 0) });
+        _cmbBadgeCorner = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 170, Margin = new Padding(0, 4, 0, 0) };
+        _cmbBadgeCorner.Items.AddRange(new object[] { "верхний левый угол", "верхний правый угол", "нижний левый угол", "нижний правый угол" });
+        _cmbBadgeCorner.SelectedIndexChanged += (s, e) => { if (!_loading) OnBadgeCornerChanged(); };
+        cornerRow.Controls.Add(_cmbBadgeCorner);
+
+        // локальные порты
+        var portRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 6, 0, 0) };
+        portRow.Controls.Add(new Label { Text = "порты: стена", AutoSize = true, Margin = new Padding(0, 8, 6, 0) });
+        _numPortWall = MakePortBox();
+        _numPortWall.ValueChanged += (s, e) => { if (!_loading) ApplyPorts(); };
+        portRow.Controls.Add(_numPortWall);
+        portRow.Controls.Add(new Label { Text = "сторож", AutoSize = true, Margin = new Padding(14, 8, 6, 0) });
+        _numPortGuard = MakePortBox();
+        _numPortGuard.ValueChanged += (s, e) => { if (!_loading) ApplyPorts(); };
+        portRow.Controls.Add(_numPortGuard);
+        portRow.Controls.Add(new Label { Text = "звук", AutoSize = true, Margin = new Padding(14, 8, 6, 0) });
+        _numPortAudio = MakePortBox();
+        _numPortAudio.ValueChanged += (s, e) => { if (!_loading) ApplyPorts(); };
+        portRow.Controls.Add(_numPortAudio);
+        _portHint = new Label { AutoSize = true, ForeColor = Color.FromArgb(93, 107, 127), Margin = new Padding(14, 8, 0, 0) };
+        portRow.Controls.Add(_portHint);
+
+        fl.Controls.AddRange(new Control[] { vlcPanel, _chkAutoApp, _chkAutoWall, _chkTrayMin, _chkTrayClose, _chkTopMost, audioRow, cornerRow, portRow, hint });
         page.Controls.Add(fl);
         return page;
     }
@@ -666,6 +694,17 @@ public class MainForm : Form
             _chkTrayClose.Checked = _app.CloseToTray;
             _chkTopMost.Checked = _app.TopMost;
             TopMost = _app.TopMost;
+
+            _numPortWall.Value = Math.Clamp(_cfg.PortWall, 1024, 65535);
+            _numPortGuard.Value = Math.Clamp(_cfg.PortGuard, 1024, 65535);
+            _numPortAudio.Value = Math.Clamp(_cfg.PortAudio, 1024, 65535);
+            _wall.VlcHttpPort = _cfg.PortWall;
+            _wall.GuardPort = _cfg.PortGuard;
+            _audio.BasePort = _cfg.PortAudio;
+            _wallBadges.Corner = _app.AudioBadgeCorner;
+            _preview.AudioCorner = _app.AudioBadgeCorner;
+            _cmbBadgeCorner.SelectedIndex = CornerIndex(_app.AudioBadgeCorner);
+            UpdatePortHint();
 
             _chkAudio.Checked = _app.AudioEnabled;
             if (_numAudioVolume != null) _numAudioVolume.Value = Math.Clamp(_app.AudioVolume, 0, 100);
@@ -829,6 +868,8 @@ public class MainForm : Form
 
     private void SaveAudioState()
     {
+        _app.AudioBadgeCorner = CornerName(_cmbBadgeCorner.SelectedIndex);
+
         _app.AudioEnabled = _audio.Enabled;
         _app.AudioVolume = _audio.Volume;
         _app.AudioChannels = _audio.EnabledChannels();
@@ -843,6 +884,96 @@ public class MainForm : Form
         UpdatePreview();
         UpdateWallBadges();
         UpdateAudioHint();
+    }
+
+    private static NumericUpDown MakePortBox()
+    {
+        return new NumericUpDown
+        {
+            Minimum = 1024,
+            Maximum = 65535,
+            Increment = 1,
+            Width = 76,
+            Margin = new Padding(0, 4, 0, 0)
+        };
+    }
+
+    private static readonly string[] CornerNames = { "top-left", "top-right", "bottom-left", "bottom-right" };
+
+    private static int CornerIndex(string name)
+    {
+        int i = Array.IndexOf(CornerNames, name ?? "");
+        return i < 0 ? 3 : i;
+    }
+
+    private static string CornerName(int index)
+    {
+        if (index < 0 || index >= CornerNames.Length) return "bottom-right";
+        return CornerNames[index];
+    }
+
+    /// <summary>Порты применяются сразу: стена при следующем запуске, звук — при переключении.</summary>
+    private void ApplyPorts()
+    {
+        _wall.VlcHttpPort = (int)_numPortWall.Value;
+        _wall.GuardPort = (int)_numPortGuard.Value;
+        _audio.BasePort = (int)_numPortAudio.Value;
+        UpdatePortHint();
+    }
+
+    private void OnBadgeCornerChanged()
+    {
+        var corner = CornerName(_cmbBadgeCorner.SelectedIndex);
+        _wallBadges.Corner = corner;
+        _preview.AudioCorner = corner;
+        _app.AudioBadgeCorner = corner;
+        SaveAudioState();
+        RefreshAudioUi();
+    }
+
+    /// <summary>Проверка портов: значения разные и звук не попадает на порты стены и сторожа.</summary>
+    private bool PortsOk(out string problem)
+    {
+        problem = null;
+        int wall = (int)_numPortWall.Value;
+        int guard = (int)_numPortGuard.Value;
+        int audio = (int)_numPortAudio.Value;
+
+        if (wall == guard || wall == audio || guard == audio)
+        {
+            problem = "Порты должны быть разными.";
+            return false;
+        }
+        if (audio + 15 >= guard && audio <= guard)
+        {
+            problem = "Диапазон звука (" + audio + "…" + (audio + 15) + ") пересекается с портом сторожа.";
+            return false;
+        }
+        if (audio + 15 >= wall && audio <= wall)
+        {
+            problem = "Диапазон звука (" + audio + "…" + (audio + 15) + ") пересекается с портом стены.";
+            return false;
+        }
+        if (wall > 65535 - 20 || audio > 65535 - 16)
+        {
+            problem = "Слишком близко к 65535: нужно место для диапазона звука.";
+            return false;
+        }
+        return true;
+    }
+
+    private void UpdatePortHint()
+    {
+        if (_portHint == null) return;
+        string problem;
+        if (!PortsOk(out problem))
+        {
+            _portHint.Text = problem;
+            _portHint.ForeColor = Color.FromArgb(185, 28, 28);
+            return;
+        }
+        _portHint.Text = "звук занимает " + _numPortAudio.Value + "…" + (_numPortAudio.Value + 15) + " · применяется при запуске стены";
+        _portHint.ForeColor = Color.FromArgb(93, 107, 127);
     }
 
     private void UpdateAudioHint()
@@ -1348,6 +1479,22 @@ public class MainForm : Form
         else if (cams > w && Ask(
                      "Включённых камер (" + cams + ") больше, чем окон в сетке (" + w + ").\r\nЛишние камеры не будут показаны. Продолжить?",
                      "Видеостена", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+
+        string portProblem;
+        if (!PortsOk(out portProblem))
+        {
+            Ask(portProblem + Environment.NewLine + Environment.NewLine +
+                "Исправьте порты на вкладке «Общие» и сохраните снова.",
+                "Видеостена", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        _cfg.PortWall = (int)_numPortWall.Value;
+        _cfg.PortGuard = (int)_numPortGuard.Value;
+        _cfg.PortAudio = (int)_numPortAudio.Value;
+        _wall.VlcHttpPort = _cfg.PortWall;
+        _wall.GuardPort = _cfg.PortGuard;
+        _audio.BasePort = _cfg.PortAudio;
 
         _cfg.Layout = _cols.Value + "x" + _rows.Value;
         _cfg.Windowed = _chkWindowed.Checked;

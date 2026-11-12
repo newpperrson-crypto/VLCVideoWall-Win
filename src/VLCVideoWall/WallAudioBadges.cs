@@ -31,6 +31,9 @@ public sealed class WallAudioBadges : IDisposable
     /// Привести значки в соответствие с плитками.
     /// <paramref name="tiles"/> — прямоугольники плиток в экранных координатах.
     /// </summary>
+    /// <summary>Угол значка: "top-left", "top-right", "bottom-left", "bottom-right".</summary>
+    public string Corner { get; set; } = "bottom-right";
+
     public void Sync(IntPtr parent, IDictionary<int, Rectangle> tiles,
                      Func<int, AudioBadgeState> stateFor, Func<int, string> nameFor)
     {
@@ -68,10 +71,15 @@ public sealed class WallAudioBadges : IDisposable
             badge.CameraName = nameFor(pair.Key);
             badge.SetState(stateFor(pair.Key));
 
-            int x = pair.Value.Right - Size - Margin;
-            int y = pair.Value.Top + Margin;
-            if (x < pair.Value.Left) x = pair.Value.Left;
-            if (y < pair.Value.Top) y = pair.Value.Top;
+            var tile = pair.Value;
+            bool right = Corner == null || !Corner.EndsWith("-left", StringComparison.OrdinalIgnoreCase);
+            bool bottom = Corner != null && Corner.StartsWith("bottom", StringComparison.OrdinalIgnoreCase);
+            int x = right ? tile.Right - Size - Margin : tile.Left + Margin;
+            int y = bottom ? tile.Bottom - Size - Margin : tile.Top + Margin;
+            if (x < tile.Left) x = tile.Left;
+            if (y < tile.Top) y = tile.Top;
+            if (x + Size > tile.Right) x = Math.Max(tile.Left, tile.Right - Size);
+            if (y + Size > tile.Bottom) y = Math.Max(tile.Top, tile.Bottom - Size);
             badge.Move(x, y);
         }
     }

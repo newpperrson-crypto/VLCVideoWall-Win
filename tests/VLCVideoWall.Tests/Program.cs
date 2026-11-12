@@ -41,14 +41,16 @@ internal static class Program
         Check(!fresh.AudioEnabled, "поддержка звука выключена по умолчанию");
         Check(fresh.AudioVolume == 80, "громкость по умолчанию 80");
         Check(fresh.AudioChannels != null && fresh.AudioChannels.Count == 0, "ни одна камера не звучит по умолчанию");
+        Check(fresh.AudioBadgeCorner == "bottom-right", "угол значка по умолчанию — нижний правый");
 
         var settingsPath = Path.Combine(Path.GetTempPath(), "vw-audio-" + Guid.NewGuid().ToString("N") + ".json");
-        var saved = new AppSettings { AudioEnabled = true, AudioVolume = 35, AudioChannels = { "ch1", "ch4" } };
+        var saved = new AppSettings { AudioEnabled = true, AudioVolume = 35, AudioBadgeCorner = "top-left", AudioChannels = { "ch1", "ch4" } };
         saved.Save(settingsPath);
         var loaded = AppSettings.Load(settingsPath);
         Check(loaded.AudioEnabled, "поддержка звука сохраняется");
         Check(loaded.AudioVolume == 35, "громкость сохраняется");
         Check(loaded.AudioChannels.Count == 2 && loaded.AudioChannels.Contains("ch4"), "включённые камеры сохраняются");
+        Check(loaded.AudioBadgeCorner == "top-left", "угол значка сохраняется");
         try { File.Delete(settingsPath); } catch { }
 
         Console.WriteLine("RTSP-проверка:");
@@ -79,6 +81,9 @@ internal static class Program
             cfg.Cameras.Add(new Camera { Name = "ch2", Url = "rtsp://user:pass@192.0.2.11:554/b", Enabled = false });
             cfg.Cameras.Add(new Camera { Name = "ch3", Url = "rtsp://user:pass@192.0.2.12:554/c" });
             cfg.Windowed = true;            // стена в окне размером с полотно
+            cfg.PortWall = 4312;            // локальные порты можно менять
+            cfg.PortGuard = 43130;
+            cfg.PortAudio = 4313;
             cfg.Save(path);
 
             var text = File.ReadAllText(path, Encoding.UTF8);
@@ -87,6 +92,9 @@ internal static class Program
 
             var back = WallConfig.Load(path);
             Check(back.Windowed, "windowed = yes читается обратно");
+            Check(back.PortWall == 4312 && back.PortGuard == 43130 && back.PortAudio == 4313,
+                "порты стены, сторожа и звука сохраняются");
+            Check(text.Contains("port_wall = 4312"), "порт стены пишется в Mosaic.conf");
             Check(back.Cameras.Count == 3, "после сохранения и загрузки остаются все 3 камеры");
             Check(back.Cameras[0].Name == "ch1" && back.Cameras[1].Name == "ch2" && back.Cameras[2].Name == "ch3",
                 "порядок камер сохраняется");

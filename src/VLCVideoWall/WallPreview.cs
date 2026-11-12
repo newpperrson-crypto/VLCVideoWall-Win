@@ -25,6 +25,9 @@ public class WallPreview : Control
     /// <summary>Идёт переключение звука (по индексу окна).</summary>
     public bool[] AudioBusy = new bool[0];
 
+    /// <summary>Угол значка звука: "top-left", "top-right", "bottom-left", "bottom-right".</summary>
+    public string AudioCorner = "bottom-right";
+
     /// <summary>
     /// Состояние звуковых дорожек известно (стена запущена и камеры проверены).
     /// На остановленной стене значки показывают только настройку включения.
@@ -79,11 +82,17 @@ public class WallPreview : Control
         return cw > 0 && ch > 0;
     }
 
-    private static void DrawSpeaker(Graphics g, Rectangle cell, AudioBadgeState state)
+    private static void DrawSpeaker(Graphics g, Rectangle cell, AudioBadgeState state, string corner)
     {
         int size = Math.Min(26, Math.Min(cell.Width, cell.Height) / 3);
         if (size < 14) return;
-        var box = new Rectangle(cell.Right - size - 6, cell.Y + 6, size, size);
+
+        bool right = corner == null || !corner.EndsWith("-left", StringComparison.OrdinalIgnoreCase);
+        bool bottom = corner != null && corner.StartsWith("bottom", StringComparison.OrdinalIgnoreCase);
+        var box = new Rectangle(
+            right ? cell.Right - size - 6 : cell.Left + 6,
+            bottom ? cell.Bottom - size - 6 : cell.Y + 6,
+            size, size);
 
         using (var back = new SolidBrush(Color.FromArgb(180, 20, 24, 30)))
         using (var path = Round(box, 6))
@@ -220,7 +229,7 @@ public class WallPreview : Control
                     else if (AudioTrackKnown && pos < AudioTrack.Length && AudioTrack[pos] == AudioTrackState.Absent)
                         state = AudioBadgeState.NoTrack;
                     else if (pos < AudioOn.Length && AudioOn[pos]) state = AudioBadgeState.On;
-                    DrawSpeaker(g, cell, state);
+                    DrawSpeaker(g, cell, state, AudioCorner);
                 }
 
                 // номер окна в углу (показывает порядок заполнения)

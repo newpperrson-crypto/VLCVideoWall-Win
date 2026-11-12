@@ -39,7 +39,8 @@ public sealed class AudioController : IDisposable
         public AudioTrackState Track = AudioTrackState.Unknown;
     }
 
-    private const int BasePort = 4213;
+    /// <summary>Первый порт звуковых процессов (задаётся в настройках портов).</summary>
+    public int BasePort { get; set; } = 4213;
     private readonly Dictionary<string, Channel> _channels = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _sync = new();
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(2) };

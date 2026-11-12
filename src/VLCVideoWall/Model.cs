@@ -31,6 +31,15 @@ public class WallConfig
     /// </summary>
     public bool Windowed { get; set; }
 
+    /// <summary>Локальный HTTP-порт VLC стены (127.0.0.1).</summary>
+    public int PortWall { get; set; } = 4212;
+
+    /// <summary>Локальный порт сторожа — защита от второго экземпляра.</summary>
+    public int PortGuard { get; set; } = 42130;
+
+    /// <summary>Первый порт звуковых процессов: по одному на включённую камеру.</summary>
+    public int PortAudio { get; set; } = 4213;
+
     [JsonIgnore] public int Cols { get; private set; } = 2;
     [JsonIgnore] public int Rows { get; private set; } = 2;
     [JsonIgnore] public int Windows { get { return Cols * Rows; } }
@@ -68,6 +77,24 @@ public class WallConfig
             if (t.StartsWith("vlcpath") && eq > 0)
             {
                 cfg.VlcPath = t.Substring(eq + 1).Trim().Trim('"');
+                continue;
+            }
+            if (t.StartsWith("port_wall") && eq > 0)
+            {
+                int v;
+                if (int.TryParse(t.Substring(eq + 1).Trim(), out v) && v >= 1024 && v <= 65535) cfg.PortWall = v;
+                continue;
+            }
+            if (t.StartsWith("port_guard") && eq > 0)
+            {
+                int v;
+                if (int.TryParse(t.Substring(eq + 1).Trim(), out v) && v >= 1024 && v <= 65535) cfg.PortGuard = v;
+                continue;
+            }
+            if (t.StartsWith("port_audio") && eq > 0)
+            {
+                int v;
+                if (int.TryParse(t.Substring(eq + 1).Trim(), out v) && v >= 1024 && v <= 65535) cfg.PortAudio = v;
                 continue;
             }
             if (t.StartsWith("windowed") && eq > 0)
@@ -162,6 +189,8 @@ public class WallConfig
         sb.AppendLine("#          (пусто = без звука; Mosaic в VLC звук не собирает)");
         sb.AppendLine("#  volume = громкость звука 0..100");
         sb.AppendLine("#  windowed = yes|no — запускать стену в окне размером с полотно");
+        sb.AppendLine("#  port_wall / port_guard / port_audio — локальные порты (1024..65535),");
+        sb.AppendLine("#      должны быть разными; звук занимает port_audio … port_audio+15");
         sb.AppendLine("#             (no = на весь экран, по умолчанию)");
         sb.AppendLine("#  vlcpath = путь к vlc.exe (пусто = найти автоматически)");
         sb.AppendLine("#  logdir  = папка журнала   (пусто = папка программы)");
@@ -171,6 +200,9 @@ public class WallConfig
         sb.AppendLine("layout = " + Layout);
         sb.AppendLine("canvas = " + CanvasW + "x" + CanvasH);
         sb.AppendLine("windowed = " + (Windowed ? "yes" : "no"));
+        sb.AppendLine("port_wall = " + PortWall);
+        sb.AppendLine("port_guard = " + PortGuard);
+        sb.AppendLine("port_audio = " + PortAudio);
         if (!string.IsNullOrWhiteSpace(VlcPath)) sb.AppendLine("vlcpath = " + VlcPath.Trim());
         if (!string.IsNullOrWhiteSpace(LogDir)) sb.AppendLine("logdir = " + LogDir.Trim());
         sb.AppendLine("logkeep = " + LogKeepDays);
@@ -203,6 +235,9 @@ public class AppSettings
 
     /// <summary>Общая поддержка звука в стене. По умолчанию выключена.</summary>
     public bool AudioEnabled { get; set; }
+
+    /// <summary>Угол, в котором рисуется значок звука на плитке. По умолчанию правый нижний.</summary>
+    public string AudioBadgeCorner { get; set; } = "bottom-right";
 
     /// <summary>Громкость звука в процентах (0..100).</summary>
     public int AudioVolume { get; set; } = 80;

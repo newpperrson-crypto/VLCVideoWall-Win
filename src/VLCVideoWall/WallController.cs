@@ -6,11 +6,13 @@ namespace VLCVideoWall;
 /// <summary>Запуск/остановка видеостены и определение её состояния.</summary>
 public class WallController
 {
-    public const int GuardPort = 42130;   // лок = watchdog.ps1 (одна копия сторожа)
+    /// <summary>Локальный порт сторожа (лок = watchdog.ps1, одна копия сторожа).</summary>
+    public int GuardPort { get; set; } = 42130;
 
     public string BaseDir { get; private set; }
     public string VlcPath { get; set; } = "";     // где установлен VLC (пусто = любой vlc)
-    private const int VlcHttpPort = 4212;
+    /// <summary>Локальный HTTP-порт VLC стены.</summary>
+    public int VlcHttpPort { get; set; } = 4212;
     private Process _proc;
 
     public WallController(string baseDir) { BaseDir = baseDir; }
@@ -172,7 +174,7 @@ public class WallController
     {
         if (IsGuardBusy())
             throw new InvalidOperationException(
-                "Порт сторожа (42130) занят: вероятно, сторож уже работает. Сначала остановите стену.");
+                "Порт сторожа (" + GuardPort + ") занят: вероятно, сторож уже работает. Сначала остановите стену.");
 
         // сторож не работает, но VLC от прошлого запуска ещё умирает — ждём, не блокируя интерфейс
         if (IsVlcRunning())
@@ -196,7 +198,8 @@ public class WallController
         try { if (File.Exists(StopFlag)) File.Delete(StopFlag); } catch { }
 
         var psi = new ProcessStartInfo("powershell.exe",
-            "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + Watchdog + "\"");
+            "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + Watchdog + "\"" +
+            " -WallPort " + VlcHttpPort + " -GuardPort " + GuardPort);
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
         psi.WorkingDirectory = BaseDir;
