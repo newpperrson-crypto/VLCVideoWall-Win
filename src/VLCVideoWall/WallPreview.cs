@@ -13,11 +13,17 @@ public class WallPreview : Control
     public int CanvasH = 1080;
     public string[] Cells = new string[0];
 
-    /// <summary>Индекс плитки, звук которой слушается (-1 = звук выключен).</summary>
-    public int AudioIndex = -1;
+    /// <summary>Поддержка звука включена — значки рисуются у всех плиток.</summary>
+    public bool AudioSupport;
 
-    /// <summary>Звук выключен (значок с перечёркнутым динамиком).</summary>
-    public bool AudioMuted;
+    /// <summary>Звук включён у плитки (по индексу окна).</summary>
+    public bool[] AudioOn = new bool[0];
+
+    /// <summary>Есть ли у камеры звуковая дорожка (по индексу окна).</summary>
+    public AudioTrackState[] AudioTrack = new AudioTrackState[0];
+
+    /// <summary>Идёт переключение звука (по индексу окна).</summary>
+    public bool[] AudioBusy = new bool[0];
 
     /// <summary>Клик по плитке; аргумент — порядковый номер окна.</summary>
     public event Action<int> TileClicked;
@@ -67,7 +73,7 @@ public class WallPreview : Control
         return cw > 0 && ch > 0;
     }
 
-    private static void DrawSpeaker(Graphics g, Rectangle cell, bool muted)
+    private static void DrawSpeaker(Graphics g, Rectangle cell, AudioBadgeState state)
     {
         int size = Math.Min(26, Math.Min(cell.Width, cell.Height) / 3);
         if (size < 14) return;
@@ -77,7 +83,14 @@ public class WallPreview : Control
         using (var path = Round(box, 6))
             g.FillPath(back, path);
 
-        var color = muted ? Color.FromArgb(248, 113, 113) : Color.FromArgb(134, 239, 172);
+        Color color;
+        switch (state)
+        {
+            case AudioBadgeState.On: color = Color.FromArgb(134, 239, 172); break;
+            case AudioBadgeState.Busy: color = Color.FromArgb(226, 232, 240); break;
+            case AudioBadgeState.NoTrack: color = Color.FromArgb(120, 128, 140); break;
+            default: color = Color.FromArgb(150, 164, 184); break;
+        }
         int bx = box.X + (int)(size * 0.22);
         int by = box.Y + (int)(size * 0.34);
         int unit = Math.Max(2, size / 10);
@@ -95,19 +108,31 @@ public class WallPreview : Control
         }
         using (var pen = new Pen(color, Math.Max(1.4f, size / 14f)))
         {
-            if (muted)
-            {
-                g.DrawLine(pen, box.X + (int)(size * 0.6), box.Y + (int)(size * 0.32),
-                                box.X + (int)(size * 0.82), box.Y + (int)(size * 0.68));
-                g.DrawLine(pen, box.X + (int)(size * 0.82), box.Y + (int)(size * 0.32),
-                                box.X + (int)(size * 0.6), box.Y + (int)(size * 0.68));
-            }
-            else
+            if (state == AudioBadgeState.On)
             {
                 g.DrawArc(pen, box.X + (int)(size * 0.52), box.Y + (int)(size * 0.3),
                                (int)(size * 0.24), (int)(size * 0.4), -55, 110);
                 g.DrawArc(pen, box.X + (int)(size * 0.58), box.Y + (int)(size * 0.2),
                                (int)(size * 0.34), (int)(size * 0.6), -50, 100);
+            }
+            else if (state == AudioBadgeState.NoTrack)
+            {
+                // маленькая перечёркнутая нота: дорожки нет
+                g.DrawLine(pen, box.X + (int)(size * 0.58), box.Y + (int)(size * 0.34),
+                                box.X + (int)(size * 0.8), box.Y + (int)(size * 0.6));
+                g.DrawEllipse(pen, box.X + (int)(size * 0.6), box.Y + (int)(size * 0.52),
+                                   (int)(size * 0.16), (int)(size * 0.12));
+            }
+            else if (state == AudioBadgeState.Busy)
+            {
+                for (int i = 0; i < 3; i++)
+                    g.FillEllipse(Brushes.White, box.X + (int)(size * 0.54) + i * (int)(size * 0.11),
+                                  box.Y + (int)(size * 0.46), (int)(size * 0.06), (int)(size * 0.06));
+            }
+            else
+            {
+                g.DrawLine(pen, box.X + (int)(size * 0.6), box.Y + (int)(size * 0.34),
+                                box.X + (int)(size * 0.82), box.Y + (int)(size * 0.66));
             }
         }
     }
@@ -185,8 +210,15 @@ public class WallPreview : Control
                     }
                 }
 
-                // значок звука на плитке, которая сейчас звучит
-                if (busy && pos == AudioIndex) DrawSpeaker(g, cell, AudioMuted);
+                // значок звука у всех плиток, когда поддержка звука включена
+                if (AudioSupport && busy)
+                {
+                    var state = AudioBadgeState.Off;
+                    if (pos < AudioBusy.Length && AudioBusy[pos]) state = AudioBadgeState.Busy;
+                    else if (pos < AudioTrack.Length && AudioTrack[pos] == AudioTrackState.Absent) state = AudioBadgeState.NoTrack;
+                    else if (pos < AudioOn.Length && AudioOn[pos]) state = AudioBadgeState.On;
+                    DrawSpeaker(g, cell, state);
+                }
 
                 // номер окна в углу (показывает порядок заполнения)
                 if (cell.Width > 90 && cell.Height > 50)

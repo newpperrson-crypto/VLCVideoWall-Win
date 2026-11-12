@@ -24,12 +24,6 @@ $HEARTBEAT_FILE = Join-Path $BASE 'watchdog.heartbeat'
 $WALL_STATUS_FILE = Join-Path $BASE 'watchdog.status'
 
 $HTTP_PORT = 4212
-$AUDIO_PORT = 4213          # отдельный VLC-поток со звуком выбранной камеры
-$AUDIO_PASS = ([guid]::NewGuid().ToString('N')).Substring(0, 16)
-$AUDIO_PID_FILE = Join-Path $BASE 'audio.pid'
-$AUDIO_CMD  = Join-Path $BASE 'audio.cmd'
-$AUDIO_STATUS = Join-Path $BASE 'audio.status'
-$script:AUDIO_AUTH = 'Basic ' + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(':' + $AUDIO_PASS))
 # VW-07: пароль HTTP-интерфейса VLC уникален для каждого запуска и не попадает в журнал
 $HTTP_PASS = ([guid]::NewGuid().ToString('N')).Substring(0, 16)
 $script:AuthHeader = 'Basic ' + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(':' + $HTTP_PASS))
@@ -143,8 +137,6 @@ function Read-MosaicConf([string]$path) {
     $canvasW = 1920
     $canvasH = 1080
     $windowed = $false
-    $audioName = ''
-    $volume = 80
     $cams = @()
     foreach ($line in (Get-Content -LiteralPath $path -Encoding UTF8)) {
         $t = $line.Trim()
@@ -155,10 +147,6 @@ function Read-MosaicConf([string]$path) {
         } elseif ($t -match '^canvas\s*=\s*(\d+)\s*[xхX×]\s*(\d+)') {
             $canvasW = [int]$Matches[1]
             $canvasH = [int]$Matches[2]
-        } elseif ($t -match '^audio\s*=\s*(.*)$') {
-            $audioName = $Matches[1].Trim().Trim('"')
-        } elseif ($t -match '^volume\s*=\s*(\d+)') {
-            $volume = [Math]::Min(100, [Math]::Max(0, [int]$Matches[1]))
         } elseif ($t -match '^windowed\s*=\s*(\S+)') {
             # стена в окне размером с полотно; по умолчанию выключено
             $windowed = @('yes', 'on', 'true', '1', 'да') -contains $Matches[1].ToLowerInvariant().Trim('"')
@@ -179,7 +167,7 @@ function Read-MosaicConf([string]$path) {
     return [pscustomobject]@{
         Layout = $layout; Cams = @($cams)
         CanvasW = $canvasW; CanvasH = $canvasH; BgFile = $bgFile
-        Windowed = $windowed; AudioSource = $audioName; Volume = $volume
+        Windowed = $windowed
     }
 }
 
@@ -250,11 +238,9 @@ function Initialize-Scene {
             Cols = [int]$p[0]; Rows = [int]$p[1]
             CanvasW = $conf.CanvasW; CanvasH = $conf.CanvasH; BgFile = $conf.BgFile
             Windowed = [bool]$conf.Windowed
-            AudioSource = [string]$conf.AudioSource; Volume = [int]$conf.Volume
         }
     }
     $vlm = Join-Path $BASE 'Mosaic.vlm'
-    return [pscustomobject]@{ Path = $vlm; Channels = @(Read-ChannelsFromVlm $vlm); Layout = 'Mosaic.vlm'; Cols = 0; Rows = 0; CanvasW = 0; CanvasH = 0; BgFile = ''; Windowed = $false; AudioSource = ''; Volume = 80 }
 }
 
 # ------------------------- служебное -------------------------
@@ -730,135 +716,11 @@ function Start-SleepChecked([int]$seconds) {
     return $true
 }
 
-# ------------------------- звук -------------------------
-# Mosaic в VLC 3 звук не собирает: у mosaic-bridge есть только видеопараметры.
-# Поэтому звук выбранной камеры выводит отдельный процесс VLC без видео.
-
-function Get-CameraUrl([string]$name) {
-    foreach ($c in $script:CAMERAS) {
-        if ($c.Name -eq $name) { return $c.Url }
-    }
-    return $null
-}
-
-function Write-AudioStatus {
-    try {
-        $src = 'off'
-        if ($script:AUDIO_SRC) { $src = [string]$script:AUDIO_SRC }
-        $mute = 'off'
-        if ($script:AUDIO_MUTED) { $mute = 'on' }
-        $play = 0
-        if ($script:AUDIO_PROC -and -not $script:AUDIO_PROC.HasExited) { $play = 1 }
-        $lines = @(
-            ([string][DateTime]::UtcNow.Ticks),
-            ('source=' + $src),
-            ('muted=' + $mute),
-            ('volume=' + [string]$script:AUDIO_VOL),
-            ('playing=' + [string]$play)
-        )
-        Set-Content -LiteralPath $AUDIO_STATUS -Value $lines -Encoding ASCII
-    } catch { }
-}
-
-function Remove-AudioStatus {
-    try { Remove-Item -LiteralPath $AUDIO_STATUS -Force -ErrorAction SilentlyContinue } catch { }
-}
-
-function Stop-MosaicAudio {
-    if ($script:AUDIO_PROC) {
-        try { if (-not $script:AUDIO_PROC.HasExited) { $script:AUDIO_PROC.Kill() } } catch { }
-        try { $script:AUDIO_PROC.Dispose() } catch { }
-        $script:AUDIO_PROC = $null
-    }
-    try { Remove-Item -LiteralPath $AUDIO_PID_FILE -Force -ErrorAction SilentlyContinue } catch { }
-    $script:AUDIO_APPLIED = -1
-}
-
-function Set-AudioSource([string]$name) {
-    # переключение источника: старый процесс гасим, новый поднимаем
-    Stop-MosaicAudio
-    $script:AUDIO_SRC = ''
-    $name = ($name + '').Trim()
-    if (-not $name -or $name -eq 'off') {
-        Write-Log 'звук: выключен'
-        return
-    }
-    $url = Get-CameraUrl $name
-    if (-not $url) {
-        Write-Log ('звук: камера {0} не найдена в конфиге' -f $name)
-        return
-    }
-    $vol = [int]($script:AUDIO_VOL * 256 / 100)
-    # адрес камеры с логином и паролем в журнал не пишем
-    $argStr = '-I dummy --no-video --no-video-title-show --rtsp-tcp --volume {0} --extraintf http --http-host 127.0.0.1 --http-port {1} --http-password {2} --verbose 1 "{3}"' -f `
-        $vol, $AUDIO_PORT, $AUDIO_PASS, $url
-    try {
-        $p = Start-Process -FilePath $script:VLC_EXE -ArgumentList $argStr -WorkingDirectory $BASE -PassThru
-        $script:AUDIO_PROC = $p
-        $script:AUDIO_SRC = $name
-        $script:AUDIO_APPLIED = $vol
-        try {
-            Set-Content -LiteralPath $AUDIO_PID_FILE -Value ('{0} {1}' -f $p.Id, $p.StartTime.ToUniversalTime().Ticks) -Encoding ASCII
-        } catch { }
-        Write-Log ('звук: включён {0}, громкость {1}%' -f $name, $script:AUDIO_VOL)
-    } catch {
-        Write-Log ('звук: не удалось запустить ({0})' -f $_.Exception.Message)
-        $script:AUDIO_PROC = $null
-    }
-}
-
-function Apply-AudioState {
-    if (-not $script:AUDIO_PROC -or $script:AUDIO_PROC.HasExited) { return }
-    $val = if ($script:AUDIO_MUTED) { 0 } else { [int]($script:AUDIO_VOL * 256 / 100) }
-    if ($val -eq $script:AUDIO_APPLIED) { return }
-    try {
-        [void](Get-UrlOn $AUDIO_PORT $script:AUDIO_AUTH ('/requests/status.xml?command=volume&val=' + $val) 3000)
-        $script:AUDIO_APPLIED = $val
-        $stateText = 'со звуком'
-        if ($script:AUDIO_MUTED) { $stateText = 'без звука' }
-        Write-Log ('звук: громкость {0}%, {1}' -f $script:AUDIO_VOL, $stateText)
-    } catch { }
-}
-
-function Update-Audio {
-    # команда приложения: audio.cmd со строками source= / mute= / volume=
-    if (Test-Path -LiteralPath $AUDIO_CMD) {
-        $newSource = $null
-        $applied = @()
-        try {
-            $text = Get-Content -LiteralPath $AUDIO_CMD -Raw -ErrorAction Stop
-            if ($null -eq $text) { $text = '' }
-            foreach ($line in ($text -split "`r?`n")) {
-                $t = $line.Trim()
-                if ($t -match '^source\s*=\s*(.*)$') { $newSource = $Matches[1].Trim() }
-                elseif ($t -match '^mute\s*=\s*(on|off)$') { $script:AUDIO_MUTED = ($Matches[1] -eq 'on') }
-                elseif ($t -match '^volume\s*=\s*(\d+)$') { $script:AUDIO_VOL = [Math]::Min(100, [Math]::Max(0, [int]$Matches[1])) }
-            }
-            if ($null -ne $newSource -and $newSource -ne $script:AUDIO_SRC) { Set-AudioSource $newSource }
-            Apply-AudioState
-            Write-Log ('звук: команда обработана ({0})' -f (($text -split "`r?`n" | Where-Object { $_.Trim() }) -join '; '))
-        } catch { }
-        try { Remove-Item -LiteralPath $AUDIO_CMD -Force -ErrorAction SilentlyContinue } catch { }
-    }
-
-    # держим процесс живым
-    if ($script:AUDIO_SRC -and (-not $script:AUDIO_PROC -or $script:AUDIO_PROC.HasExited)) {
-        Write-Log ('звук: процесс {0} завершился — перезапускаю' -f $script:AUDIO_SRC)
-        $keep = $script:AUDIO_SRC
-        Set-AudioSource $keep
-        Apply-AudioState
-    }
-
-    Write-AudioStatus
-}
-
 function Complete-Stop($proc, [string]$why) {
     # Единый выход по stop.flag: гасим VLC, снимаем флаг — приложение сразу видит остановку.
     # FUP4-01: если VLC не завершился, это не скрываем: vlc.pid остаётся, приложение
     # увидит живой процесс и сообщит, что стена не остановлена.
     Write-Log $why
-    Stop-MosaicAudio
-    Remove-AudioStatus
     $stopped = Stop-MosaicVlc $proc
     if (-not $stopped) {
         Write-Log 'ВНИМАНИЕ: VLC не удалось завершить — стена считается неостановленной, vlc.pid сохранён'
@@ -898,24 +760,7 @@ function Invoke-Watchdog {
     $addr = ($channels | ForEach-Object { '{0}={1}:{2}' -f $_.Name, $_.HostName, $_.Port }) -join '; '
     Write-Log ('адреса: {0}' -f $addr)
 
-    # --- звук: состояние и источник ---
     $script:CAMERAS = @($channels)
-    $script:AUDIO_SRC = ''
-    $script:AUDIO_MUTED = $false
-    $script:AUDIO_VOL = [Math]::Min(100, [Math]::Max(0, [int]$scene.Volume))
-    $script:AUDIO_PROC = $null
-    $script:AUDIO_APPLIED = -1
-    try { Remove-Item -LiteralPath $AUDIO_CMD -Force -ErrorAction SilentlyContinue } catch { }
-    Stop-MosaicAudio
-    Remove-AudioStatus
-    if ($scene.AudioSource) {
-        Write-Log ('звук: источник {0}, громкость {1}%' -f $scene.AudioSource, $script:AUDIO_VOL)
-        Set-AudioSource $scene.AudioSource
-        Apply-AudioState
-    } else {
-        Write-Log 'звук: выключен в конфиге (audio = )'
-    }
-    Write-AudioStatus
 
     $proc = $null
     $graceUntil = 0.0
@@ -926,8 +771,6 @@ function Invoke-Watchdog {
     # иначе два процесса подерутся за порт 4212, а vlc.pid будет перезаписан
     $leftover = Get-OwnVlcFromPid
     if ($leftover) {
-        Stop-MosaicAudio
-        Remove-AudioStatus
         Write-Log ('ОСТАНОВ: прошлый VLC (PID {0}) ещё работает — сначала завершите его. vlc.pid сохранён.' -f $leftover.Id)
         return 1
     }
@@ -939,7 +782,6 @@ function Invoke-Watchdog {
             return (Complete-Stop $proc 'найден stop.flag - останавливаюсь')
         }
 
-        Update-Audio
 
         # окно не нужного размера (VLC ещё не создал окно) — дотягиваем до полотна
         if ($script:WINDOWED -and -not $script:WindowSized -and $proc -and -not $proc.HasExited) {
@@ -971,8 +813,6 @@ function Invoke-Watchdog {
                 Write-Log ('HTTP-интерфейс VLC не поднялся (попытка {0} из 3)' -f $failStarts)
                 # FUP4-01: пока старый процесс жив, второй экземпляр не запускаем
                 if (-not (Stop-MosaicVlc $proc)) {
-        Stop-MosaicAudio
-        Remove-AudioStatus
                     Write-Log 'ОСТАНОВ: VLC не завершился — второй экземпляр не запускаю, vlc.pid сохранён'
                     return 1
                 }
@@ -1014,8 +854,6 @@ function Invoke-Watchdog {
                 Write-Log 'VLC завис - жёсткий перезапуск приложения'
                 # FUP4-01: перезапуск только после подтверждённого завершения
                 if (-not (Stop-MosaicVlc $proc)) {
-        Stop-MosaicAudio
-        Remove-AudioStatus
                     Write-Log 'ОСТАНОВ: зависший VLC не завершился — перезапуск отменён, vlc.pid сохранён'
                     return 1
                 }

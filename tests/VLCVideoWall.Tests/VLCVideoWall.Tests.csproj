@@ -14,10 +14,10 @@
   <!-- тестируем чистую логику из основного проекта, не дублируя код -->
   <ItemGroup>
     <Compile Include="..\..\src\VLCVideoWall\Model.cs" Link="Model.cs" />
+    <Compile Include="..\..\src\VLCVideoWall\AudioController.cs" Link="AudioController.cs" />
     <Compile Include="..\..\src\VLCVideoWall\RtspProbe.cs" Link="RtspProbe.cs" />
     <Compile Include="..\..\src\VLCVideoWall\VlcProcessInfo.cs" Link="VlcProcessInfo.cs" />
     <Compile Include="..\..\src\VLCVideoWall\WallStatusFile.cs" Link="WallStatusFile.cs" />
-    <Compile Include="..\..\src\VLCVideoWall\AudioStatus.cs" Link="AudioStatus.cs" />
   </ItemGroup>
 
 </Project>

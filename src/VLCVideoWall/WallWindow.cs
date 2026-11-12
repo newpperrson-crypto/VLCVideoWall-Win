@@ -37,6 +37,12 @@ public static class WallWindow
     private static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
 
     [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern bool IsChild(IntPtr parent, IntPtr child);
+
+    [DllImport("user32.dll")]
     private static extern bool ClientToScreen(IntPtr hWnd, ref POINT point);
 
     /// <summary>
@@ -45,6 +51,17 @@ public static class WallWindow
     /// </summary>
     public static bool TryGetClientOnScreen(int pid, out Rectangle client)
     {
+        IntPtr hwnd;
+        return TryGetVideoWindow(pid, out hwnd, out client);
+    }
+
+    /// <summary>
+    /// Окно видеовыхода нашего VLC: дескриптор и клиентская область в экранных
+    /// координатах. Дескриптор нужен, чтобы значки звука стали дочерними окнами стены.
+    /// </summary>
+    public static bool TryGetVideoWindow(int pid, out IntPtr hwnd, out Rectangle client)
+    {
+        hwnd = IntPtr.Zero;
         client = Rectangle.Empty;
         IntPtr found = IntPtr.Zero;
 
@@ -65,6 +82,7 @@ public static class WallWindow
         }, IntPtr.Zero);
 
         if (found == IntPtr.Zero) return false;
+        hwnd = found;
 
         RECT rc;
         if (!GetClientRect(found, out rc)) return false;
@@ -73,6 +91,17 @@ public static class WallWindow
 
         client = new Rectangle(origin.X, origin.Y, rc.Right - rc.Left, rc.Bottom - rc.Top);
         return client.Width > 0 && client.Height > 0;
+    }
+
+    /// <summary>
+    /// Окно стены на переднем плане. Значки звука показываются только тогда:
+    /// иначе они висели бы поверх окон, открытых пользователем.
+    /// </summary>
+    public static bool IsActive(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return false;
+        var fg = GetForegroundWindow();
+        return fg == hwnd || IsChild(hwnd, fg);
     }
 
     /// <summary>Процесс стены по vlc.pid: PID и время старта должны совпадать.</summary>

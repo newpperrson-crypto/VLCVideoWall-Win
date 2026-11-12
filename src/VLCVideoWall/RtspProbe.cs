@@ -61,9 +61,73 @@ public static class RtspProbe
         catch (Exception ex) { return "ошибка: " + ex.Message; }
     }
 
+    /// <summary>
+    /// Есть ли в RTSP-потоке звуковая дорожка. Определяется по SDP (DESCRIBE):
+    /// строка <c>m=audio</c>. Absent — сервер ответил и звука нет; Unknown — проверить не удалось.
+    /// </summary>
+    public static AudioTrackState HasAudioTrack(string url, int timeoutMs = 3000)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return AudioTrackState.Unknown;
+
+        Uri u;
+        if (!Uri.TryCreate(url.Trim(), UriKind.Absolute, out u) || u.Scheme != "rtsp") return AudioTrackState.Unknown;
+
+        int port = u.Port > 0 ? u.Port : 554;
+        string path = string.IsNullOrEmpty(u.PathAndQuery) ? "/" : u.PathAndQuery;
+        string absUri = "rtsp://" + u.Host + ":" + port + path;
+        string userInfo = string.IsNullOrEmpty(u.UserInfo) ? null : Uri.UnescapeDataString(u.UserInfo);
+
+        try
+        {
+            bool connected;
+            string head = Describe(u.Host, port, absUri,
+                userInfo == null ? null : BasicHeader(userInfo), 10, timeoutMs, out connected);
+            if (head == null) return AudioTrackState.Unknown;
+
+            int code = StatusCode(head);
+            if (code == 401 && userInfo != null)
+            {
+                string challenge = Headers(head, "WWW-Authenticate")
+                    .FirstOrDefault(h => h.StartsWith("Digest", StringComparison.OrdinalIgnoreCase));
+                if (challenge != null)
+                {
+                    string digest = DigestHeaderFor("DESCRIBE", challenge, absUri, userInfo);
+                    if (digest != null)
+                    {
+                        head = Describe(u.Host, port, absUri, digest, 11, timeoutMs, out connected);
+                        if (head == null) return AudioTrackState.Unknown;
+                        code = StatusCode(head);
+                    }
+                }
+            }
+
+            if (code != 200) return AudioTrackState.Unknown;
+            return head.IndexOf("m=audio", StringComparison.OrdinalIgnoreCase) >= 0
+                ? AudioTrackState.Present
+                : AudioTrackState.Absent;
+        }
+        catch
+        {
+            return AudioTrackState.Unknown;
+        }
+    }
+
     /// <summary>Отправляет OPTIONS и читает заголовок ответа. null = ответа нет.</summary>
     private static string Exchange(string host, int port, string absUri, string auth, int cseq,
                                    int timeoutMs, out bool connected)
+    {
+        return ExchangeCore("OPTIONS", host, port, absUri, auth, cseq, timeoutMs, false, out connected);
+    }
+
+    /// <summary>Отправляет DESCRIBE и читает ответ целиком (заголовки и SDP).</summary>
+    private static string Describe(string host, int port, string absUri, string auth, int cseq,
+                                   int timeoutMs, out bool connected)
+    {
+        return ExchangeCore("DESCRIBE", host, port, absUri, auth, cseq, timeoutMs, true, out connected);
+    }
+
+    private static string ExchangeCore(string method, string host, int port, string absUri, string auth, int cseq,
+                                       int timeoutMs, bool withBody, out bool connected)
     {
         connected = false;
         using (var client = new TcpClient())
@@ -79,16 +143,17 @@ public static class RtspProbe
                 stream.WriteTimeout = timeoutMs;
 
                 var req = new StringBuilder();
-                req.Append("OPTIONS ").Append(absUri).Append(" RTSP/1.0\r\n");
+                req.Append(method).Append(' ').Append(absUri).Append(" RTSP/1.0\r\n");
                 req.Append("CSeq: ").Append(cseq).Append("\r\n");
                 req.Append("User-Agent: VLCVideoWall\r\n");
                 if (auth != null) req.Append("Authorization: ").Append(auth).Append("\r\n");
+                if (withBody) req.Append("Accept: application/sdp\r\n");
                 req.Append("\r\n");
 
                 var bytes = Encoding.ASCII.GetBytes(req.ToString());
                 stream.Write(bytes, 0, bytes.Length);
 
-                var buf = new byte[1024];
+                var buf = new byte[4096];
                 var head = new StringBuilder();
                 var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
                 while (DateTime.UtcNow < deadline)
@@ -102,7 +167,28 @@ public static class RtspProbe
                 }
 
                 var text = head.ToString();
-                return text.Length == 0 ? null : text;
+                if (text.Length == 0) return null;
+
+                if (withBody)
+                {
+                    // SDP приходит после заголовков: дочитываем по Content-Length
+                    int split = text.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+                    string body = split >= 0 ? text.Substring(split + 4) : "";
+                    int need = 0;
+                    var lenHeader = Header(text, "Content-Length");
+                    if (lenHeader != null) int.TryParse(lenHeader, out need);
+
+                    while (body.Length < need && DateTime.UtcNow < deadline)
+                    {
+                        int n;
+                        try { n = stream.Read(buf, 0, buf.Length); }
+                        catch { break; }
+                        if (n <= 0) break;
+                        body += Encoding.ASCII.GetString(buf, 0, n);
+                    }
+                    text = text + (body.Length > 0 ? body : "");
+                }
+                return text;
             }
         }
     }
@@ -151,6 +237,11 @@ public static class RtspProbe
 
     private static string DigestHeader(string challenge, string absUri, string userInfo)
     {
+        return DigestHeaderFor("OPTIONS", challenge, absUri, userInfo);
+    }
+
+    private static string DigestHeaderFor(string method, string challenge, string absUri, string userInfo)
+    {
         string realm = Param(challenge, "realm");
         string nonce = Param(challenge, "nonce");
         if (string.IsNullOrEmpty(nonce)) return null;
@@ -162,7 +253,7 @@ public static class RtspProbe
         if (c >= 0) { user = userInfo.Substring(0, c); pass = userInfo.Substring(c + 1); }
 
         string ha1 = Md5Hex(user + ":" + realm + ":" + pass);
-        string ha2 = Md5Hex("OPTIONS:" + absUri);
+        string ha2 = Md5Hex(method + ":" + absUri);
 
         string result;
         bool withQop = qop != null && qop.Split(',').Any(q => q.Trim().Equals("auth", StringComparison.OrdinalIgnoreCase));

@@ -37,14 +37,13 @@ public class MainForm : Form
     private Label _wallInfo;
 
     // --- звук
-    private NumericUpDown _numVolume;
-    private ComboBox _audioSource;
-    private AudioBadge _badge;
+    // --- звук: общая поддержка и отдельный процесс VLC на каждую включённую камеру
+    private readonly AudioController _audio = new AudioController();
+    private readonly WallAudioBadges _wallBadges = new WallAudioBadges();
     private System.Windows.Forms.Timer _audioTimer;
-    private AudioStatus _audioStatus;
-    private string _audioSourceName = "";   // выбранная камера (пусто = без звука)
-    private bool _audioMuted;
-    private bool _audioRefreshing;   // список «Звук:» заполняется кодом, событие не обрабатываем
+    private CheckBox _chkAudio;
+    private NumericUpDown _numAudioVolume;
+    private Label _audioHint;
 
     // --- вкладка «Камеры и сетка»
     private ComboBox _preset;
@@ -114,17 +113,11 @@ public class MainForm : Form
         _statusTimer.Tick += (s, e) => UpdateStatus();
         _statusTimer.Start();
 
-        // значок звука поверх плитки: отдельное окно, потому что VLC рисует мозаику полотном
-        _badge = new AudioBadge();
-        _badge.Clicked += () =>
-        {
-            _audioMuted = !_audioMuted;
-            SendAudioState();
-            UpdateAudioBadge();
-            UpdatePreview();
-        };
-        _audioTimer = new System.Windows.Forms.Timer { Interval = 500 };
-        _audioTimer.Tick += (s, e) => UpdateAudioBadge();
+        // значки звука поверх плиток: отдельные окна, потому что VLC рисует мозаику полотном
+        _wallBadges.Toggled += pos => ToggleAudioByIndex(pos);
+        _audio.Changed += RefreshAudioUi;
+        _audioTimer = new System.Windows.Forms.Timer { Interval = 700 };
+        _audioTimer.Tick += (s, e) => { UpdateWallBadges(); UpdateAudioHint(); };
         _audioTimer.Start();
 
         _logTimer = new System.Windows.Forms.Timer { Interval = 5000 };
@@ -261,10 +254,19 @@ public class MainForm : Form
         if (_preview != null)
         {
             var namesNow = _cameras.Where(c => c.Enabled).Select(c => c.Name).ToList();
-            _preview.AudioIndex = string.IsNullOrEmpty(_audioSourceName)
-                ? -1
-                : namesNow.FindIndex(n => string.Equals(n, _audioSourceName, StringComparison.OrdinalIgnoreCase));
-            _preview.AudioMuted = _audioMuted;
+            _preview.AudioSupport = _audio.Enabled;
+            var on = new bool[namesNow.Count];
+            var track = new AudioTrackState[namesNow.Count];
+            var busy = new bool[namesNow.Count];
+            for (int i = 0; i < namesNow.Count; i++)
+            {
+                on[i] = _audio.IsOn(namesNow[i]);
+                track[i] = _audio.TrackState(namesNow[i]);
+                busy[i] = _audio.IsBusy(namesNow[i]);
+            }
+            _preview.AudioOn = on;
+            _preview.AudioTrack = track;
+            _preview.AudioBusy = busy;
         }
 
         int used = Math.Min(names.Count, cells.Length);
@@ -324,14 +326,6 @@ public class MainForm : Form
         _chkWindowed.CheckedChanged += (s, e) => { if (!_loading) UpdateCanvasInfo(); };
         rowCanvas.Controls.Add(_chkWindowed);
 
-        rowCanvas.Controls.Add(new Label { Text = "Звук:", AutoSize = true, Margin = new Padding(18, 6, 4, 0) });
-        _audioSource = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 110, Margin = new Padding(0, 2, 6, 0) };
-        _audioSource.SelectedIndexChanged += (s, e) => { if (!_loading) OnAudioSourceChanged(); };
-        rowCanvas.Controls.Add(_audioSource);
-        _numVolume = new NumericUpDown { Minimum = 0, Maximum = 100, Increment = 5, Width = 56, Margin = new Padding(0, 2, 0, 0) };
-        _numVolume.ValueChanged += (s, e) => { if (!_loading) SendAudioState(); };
-        rowCanvas.Controls.Add(_numVolume);
-        rowCanvas.Controls.Add(new Label { Text = "%", AutoSize = true, Margin = new Padding(2, 6, 0, 0) });
 
         // подпись к полотну — отдельной строкой: справа от полей она не влезает
         var rowCanvasInfo = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 32, WrapContents = false, Padding = new Padding(2, 0, 0, 0) };
@@ -377,8 +371,8 @@ public class MainForm : Form
         _grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = "Url", HeaderText = "RTSP-адрес", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, SortMode = DataGridViewColumnSortMode.NotSortable });
         _grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = "Check", HeaderText = "Проверка", Width = 230, ReadOnly = true, SortMode = DataGridViewColumnSortMode.NotSortable });
         _grid.DataSource = _cameras;
-        _grid.CellEndEdit += (s, e) => { UpdateInfo(); RefreshAudioSources(); };
-        _grid.DataBindingComplete += (s, e) => { UpdateInfo(); RefreshAudioSources(); };
+        _grid.CellEndEdit += (s, e) => { UpdateInfo(); RefreshAudioUi(); };
+        _grid.DataBindingComplete += (s, e) => { UpdateInfo(); RefreshAudioUi(); };
 
         var hint = new Label
         {
@@ -506,7 +500,37 @@ public class MainForm : Form
                    "Отключать VLC в этот момент вручную не нужно."
         };
 
-        fl.Controls.AddRange(new Control[] { vlcPanel, _chkAutoApp, _chkAutoWall, _chkTrayMin, _chkTrayClose, _chkTopMost, hint });
+        // поддержка звука: общий выключатель, по умолчанию выключен
+        var audioRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 10, 0, 0) };
+        _chkAudio = new CheckBox
+        {
+            Text = "Поддержка звука",
+            AutoSize = true,
+            Margin = new Padding(0, 4, 14, 0)
+        };
+        _chkAudio.CheckedChanged += (s, e) => OnAudioSupportChanged();
+        audioRow.Controls.Add(_chkAudio);
+
+        audioRow.Controls.Add(new Label { Text = "громкость", AutoSize = true, Margin = new Padding(0, 8, 6, 0) });
+        _numAudioVolume = new NumericUpDown
+        {
+            Minimum = 0, Maximum = 100, Increment = 5, Width = 62,
+            Margin = new Padding(0, 4, 4, 0)
+        };
+        _numAudioVolume.ValueChanged += (s, e) =>
+        {
+            if (_loading) return;
+            _audio.Volume = (int)_numAudioVolume.Value;
+            _audio.ApplyVolumeAll();
+            SaveAudioState();
+        };
+        audioRow.Controls.Add(_numAudioVolume);
+        audioRow.Controls.Add(new Label { Text = "%", AutoSize = true, Margin = new Padding(2, 8, 0, 0) });
+
+        _audioHint = new Label { AutoSize = true, ForeColor = Color.FromArgb(93, 107, 127), Margin = new Padding(18, 8, 0, 0) };
+        audioRow.Controls.Add(_audioHint);
+
+        fl.Controls.AddRange(new Control[] { vlcPanel, _chkAutoApp, _chkAutoWall, _chkTrayMin, _chkTrayClose, _chkTopMost, audioRow, hint });
         page.Controls.Add(fl);
         return page;
     }
@@ -625,9 +649,6 @@ public class MainForm : Form
             _canvasPreset.SelectedItem = string.IsNullOrEmpty(stdCanvas.Name) ? "Другое…" : stdCanvas.Name;
             _canvasW.Value = Math.Clamp(_cfg.CanvasW, (int)_canvasW.Minimum, (int)_canvasW.Maximum);
             _chkWindowed.Checked = _cfg.Windowed;
-            _audioSourceName = _cfg.AudioSource ?? "";
-            if (_numVolume != null) _numVolume.Value = Math.Clamp(_cfg.Volume, 0, 100);
-            RefreshAudioSources();
             _canvasH.Value = Math.Clamp(_cfg.CanvasH, (int)_canvasH.Minimum, (int)_canvasH.Maximum);
             _canvasW.Enabled = _canvasH.Enabled = _canvasPreset.SelectedItem.ToString().StartsWith("Другое");
             UpdateCanvasInfo();
@@ -644,6 +665,13 @@ public class MainForm : Form
             _chkTrayClose.Checked = _app.CloseToTray;
             _chkTopMost.Checked = _app.TopMost;
             TopMost = _app.TopMost;
+
+            _chkAudio.Checked = _app.AudioEnabled;
+            if (_numAudioVolume != null) _numAudioVolume.Value = Math.Clamp(_app.AudioVolume, 0, 100);
+            _audio.Enabled = _app.AudioEnabled;
+            _audio.Volume = Math.Clamp(_app.AudioVolume, 0, 100);
+            _audio.SetCameras(_cameras);
+            _audio.RestoreStates(_app.AudioChannels);
             _chkLogAuto.Checked = _app.LogAutoRefresh;
 
             if (_app.Width > 400 && _app.Height > 400) Size = new Size(_app.Width, _app.Height);
@@ -759,130 +787,134 @@ public class MainForm : Form
             windowed ? "в окне " + w + "×" + h : "на весь экран");
     }
 
-    /// <summary>Список «Звук:» — имена включённых камер и «выключен».</summary>
-    private void RefreshAudioSources()
-    {
-        if (_audioSource == null) return;
-        var names = _cameras.Where(c => c.Enabled).Select(c => c.Name).ToList();
-        string current = _audioSourceName;
-        _audioRefreshing = true;
-        try
-        {
-            _audioSource.Items.Clear();
-            _audioSource.Items.Add("выключен");
-            foreach (var n in names) _audioSource.Items.Add(n);
-            int idx = string.IsNullOrEmpty(current) ? 0 : _audioSource.Items.IndexOf(current);
-            _audioSource.SelectedIndex = idx < 0 ? 0 : idx;
-        }
-        finally { _audioRefreshing = false; }
-    }
-
-    private void OnAudioSourceChanged()
-    {
-        if (_audioSource == null || _audioRefreshing) return;
-        var sel = _audioSource.SelectedItem as string;
-        _audioSourceName = (string.IsNullOrEmpty(sel) || sel == "выключен") ? "" : sel;
-        _audioMuted = false;
-        SendAudioState();
-        UpdatePreview();
-    }
-
-    /// <summary>Клик по плитке: выбрать источник звука или переключить «без звука».</summary>
+    /// <summary>Клик по плитке: включить или выключить звук этой камеры.</summary>
     private void OnTileClicked(int index)
     {
+        ToggleAudioByIndex(index);
+    }
+
+    /// <summary>Переключить звук плитки. Недоступно, если поддержка звука выключена.</summary>
+    private void ToggleAudioByIndex(int index)
+    {
+        if (!_audio.Enabled) return;
         var names = _cameras.Where(c => c.Enabled).Select(c => c.Name).ToList();
         if (index < 0 || index >= names.Count) return;
 
-        var name = names[index];
-        if (string.Equals(name, _audioSourceName, StringComparison.OrdinalIgnoreCase))
-            _audioMuted = !_audioMuted;      // повторный клик по той же плитке — mute
+        if (!_audio.Toggle(names[index])) { UpdateAudioHint(); return; }
+
+        SaveAudioState();
+        RefreshAudioUi();          // сразу показываем «принято» — значок становится Busy
+    }
+
+    /// <summary>Поддержка звука переключена в «Общих настройках».</summary>
+    private void OnAudioSupportChanged()
+    {
+        if (_loading) return;
+        _audio.Enabled = _chkAudio.Checked;
+        _audio.SetCameras(_cameras);
+
+        if (!_audio.Enabled) _audio.StopAll();
         else
         {
-            _audioSourceName = name;
-            _audioMuted = false;
+            if (_wall.IsRunning) _audio.StartEnabled();
+            _audio.ProbeTracks();
         }
 
-        if (_audioSource != null)
-        {
-            int idx = _audioSource.Items.IndexOf(_audioSourceName);
-            if (idx >= 0) _audioSource.SelectedIndex = idx;
-        }
-        SendAudioState();
+        SaveAudioState();
+        RefreshAudioUi();
         UpdatePreview();
     }
 
-    /// <summary>Отправляет сторожу источник, громкость и признак «без звука».</summary>
-    private void SendAudioState()
+    private void SaveAudioState()
     {
-        if (_loading) return;
-        int vol = _numVolume != null ? (int)_numVolume.Value : 80;
-        var text = "source=" + (_audioSourceName ?? "") + Environment.NewLine +
-                   "mute=" + (_audioMuted ? "on" : "off") + Environment.NewLine +
-                   "volume=" + vol + Environment.NewLine;
-        try { _wall.SendAudioCommand(text); }
-        catch (Exception ex) { LogUi("не удалось передать команду звука: " + ex.Message); }
+        _app.AudioEnabled = _audio.Enabled;
+        _app.AudioVolume = _audio.Volume;
+        _app.AudioChannels = _audio.EnabledChannels();
+        try { _app.Save(_settingsPath); } catch { }
+    }
+
+    /// <summary>Обновить всё, что показывает звук: макет, значки на стене, подпись.</summary>
+    private void RefreshAudioUi()
+    {
+        if (IsDisposed || Disposing) return;
+        if (InvokeRequired) { try { BeginInvoke(new Action(RefreshAudioUi)); } catch { } return; }
+        UpdatePreview();
+        UpdateWallBadges();
+        UpdateAudioHint();
+    }
+
+    private void UpdateAudioHint()
+    {
+        if (_audioHint == null) return;
+        if (!_audio.Enabled) { _audioHint.Text = "значки звука скрыты"; return; }
+
+        int on = _audio.EnabledChannels().Count;
+        int silent = _cameras.Count(c => c.Enabled && _audio.TrackState(c.Name) == AudioTrackState.Absent);
+        var text = on == 0 ? "звук выключен у всех окон" : "звук включён: " + on + " из " + _cameras.Count(c => c.Enabled);
+        if (silent > 0) text += " · без звуковой дорожки: " + silent;
+        _audioHint.Text = text;
+    }
+
+    /// <summary>Значки звука над плитками живой стены.</summary>
+    private void UpdateWallBadges()
+    {
+        var empty = new Dictionary<int, Rectangle>();
+        if (!_audio.Enabled || !_wall.IsRunning)
+        {
+            _wallBadges.Sync(IntPtr.Zero, empty, p => AudioBadgeState.Off, p => "");
+            return;
+        }
+
+        IntPtr hwnd;
+        Rectangle client;
+        if (!WallWindow.TryGetVideoWindow(_wall.OwnVlcPid(), out hwnd, out client))
+        {
+            _wallBadges.Sync(IntPtr.Zero, empty, p => AudioBadgeState.Off, p => "");
+            return;
+        }
+
+        var names = _cameras.Where(c => c.Enabled).Select(c => c.Name).ToList();
+        int cols = Math.Max(1, _cfg.Cols);
+        int rows = Math.Max(1, _cfg.Rows);
+        int canvasW = Math.Max(1, _cfg.CanvasW);
+        int canvasH = Math.Max(1, _cfg.CanvasH);
+
+        // полотно вписано в клиентскую область с сохранением пропорций
+        double scale = Math.Min((double)client.Width / canvasW, (double)client.Height / canvasH);
+        int drawW = Math.Max(1, (int)(canvasW * scale));
+        int drawH = Math.Max(1, (int)(canvasH * scale));
+        int left = (client.Width - drawW) / 2;
+        int top = (client.Height - drawH) / 2;
+        int tileW = drawW / cols;
+        int tileH = drawH / rows;
+
+        // значки — отдельные окна, поэтому координаты экранные
+        var tiles = new Dictionary<int, Rectangle>();
+        int count = Math.Min(names.Count, cols * rows);
+        for (int i = 0; i < count; i++)
+        {
+            int c = i % cols, r = i / cols;
+            tiles[i] = new Rectangle(client.X + left + c * tileW, client.Y + top + r * tileH, tileW, tileH);
+        }
+
+        _wallBadges.Sync(hwnd, tiles,
+            pos => AudioStateFor(pos, names),
+            pos => pos < names.Count ? names[pos] : "",
+            WallWindow.IsActive(hwnd));
+    }
+
+    private AudioBadgeState AudioStateFor(int pos, List<string> names)
+    {
+        if (pos < 0 || pos >= names.Count) return AudioBadgeState.Off;
+        var name = names[pos];
+        if (_audio.IsBusy(name)) return AudioBadgeState.Busy;
+        if (_audio.TrackState(name) == AudioTrackState.Absent) return AudioBadgeState.NoTrack;
+        return _audio.IsOn(name) ? AudioBadgeState.On : AudioBadgeState.Off;
     }
 
     private void LogUi(string message)
     {
         try { _detail.Text = message; } catch { }
-    }
-
-    /// <summary>Значок звука поверх плитки на стене (окно приложения над VLC).</summary>
-    private void UpdateAudioBadge()
-    {
-        if (_badge == null || _badge.IsDisposed) return;
-
-        var st = _wall.ReadAudioStatus();
-        _audioStatus = st;
-
-        bool running = _wall.OwnVlcPid() != 0;
-        bool hasSource = st != null && st.HasSource;
-        if (!running || !hasSource)
-        {
-            if (_badge.Visible) _badge.Hide();
-            return;
-        }
-
-        _badge.SetMuted(st.Muted);
-        _badge.CameraName = st.Source;
-
-        int cols = Math.Max(1, (int)_cols.Value);
-        int rows = Math.Max(1, (int)_rows.Value);
-        int canvasW = Math.Max(1, (int)_canvasW.Value);
-        int canvasH = Math.Max(1, (int)_canvasH.Value);
-
-        var names = _cameras.Where(c => c.Enabled).Select(c => c.Name).ToList();
-        int index = names.FindIndex(n => string.Equals(n, st.Source, StringComparison.OrdinalIgnoreCase));
-        if (index < 0) { if (_badge.Visible) _badge.Hide(); return; }
-
-        Rectangle client;
-        if (!WallWindow.TryGetClientOnScreen(_wall.OwnVlcPid(), out client))
-        {
-            if (_badge.Visible) _badge.Hide();
-            return;
-        }
-
-        // полотно вписано в клиентскую область с сохранением пропорций
-        double scale = Math.Min((double)client.Width / canvasW, (double)client.Height / canvasH);
-        int drawW = (int)(canvasW * scale);
-        int drawH = (int)(canvasH * scale);
-        int left = client.X + (client.Width - drawW) / 2;
-        int top = client.Y + (client.Height - drawH) / 2;
-
-        int col = index % cols;
-        int row = index / cols;
-        if (row >= rows) { if (_badge.Visible) _badge.Hide(); return; }
-
-        int tileW = drawW / cols;
-        int tileH = drawH / rows;
-        const int badgeSize = 46;
-        int bx = left + col * tileW + tileW - badgeSize - 10;
-        int by = top + row * tileH + 10;
-
-        _badge.Bounds = new Rectangle(bx, by, badgeSize, badgeSize);
-        if (!_badge.Visible) _badge.Show();
-        _badge.BringToFront();
     }
 
     private void UpdateInfo()
@@ -1198,6 +1230,15 @@ public class MainForm : Form
                     "Видеостена", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             else if (_chkTrayMin.Checked)
                 HideToTray();   // стена на весь экран — окно убираем в трей
+
+            // звук: поднимаем процессы включённых камер и уточняем дорожки
+            if (_audio.Enabled)
+            {
+                _audio.SetCameras(_cameras);
+                _audio.StartEnabled();
+                _audio.ProbeTracks();
+            }
+            RefreshAudioUi();
         }
         catch (Exception ex)
         {
@@ -1241,8 +1282,10 @@ public class MainForm : Form
         }
         finally
         {
+            _audio.StopAll();
             SetBusy(false);
             UpdateStatus();
+            UpdateWallBadges();
             if (_chkLogAuto.Checked) LoadLog(false);
         }
         return ok;
@@ -1304,8 +1347,6 @@ public class MainForm : Form
 
         _cfg.Layout = _cols.Value + "x" + _rows.Value;
         _cfg.Windowed = _chkWindowed.Checked;
-        _cfg.AudioSource = _audioSourceName ?? "";
-        _cfg.Volume = _numVolume != null ? (int)_numVolume.Value : 80;
         _cfg.CanvasW = (int)_canvasW.Value;
         _cfg.CanvasH = (int)_canvasH.Value;
         _cfg.LogKeepDays = (int)_keepDays.Value;
@@ -1328,6 +1369,9 @@ public class MainForm : Form
 
         _app.AutostartApp = _chkAutoApp.Checked;
         _app.AutostartWall = _chkAutoWall.Checked;
+        _app.AudioEnabled = _audio.Enabled;
+        _app.AudioVolume = _audio.Volume;
+        _app.AudioChannels = _audio.EnabledChannels();
         _app.MinimizeToTray = _chkTrayMin.Checked;
         _app.CloseToTray = _chkTrayClose.Checked;
         _app.TopMost = _chkTopMost.Checked;
@@ -1770,7 +1814,8 @@ public class MainForm : Form
         if (disposing)
         {
             try { if (_audioTimer != null) { _audioTimer.Stop(); _audioTimer.Dispose(); } } catch { }
-            try { if (_badge != null) { _badge.Hide(); _badge.Dispose(); } } catch { }
+            try { _audio.Dispose(); } catch { }
+            try { _wallBadges.Dispose(); } catch { }
         }
 
         if (disposing)

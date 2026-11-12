@@ -20,8 +20,6 @@ public class WallController
     private string PidFile { get { return Path.Combine(BaseDir, "vlc.pid"); } }
     private string HeartbeatFile { get { return Path.Combine(BaseDir, "watchdog.heartbeat"); } }
     private string StatusFile { get { return Path.Combine(BaseDir, "watchdog.status"); } }
-    private string AudioCmdFile { get { return Path.Combine(BaseDir, "audio.cmd"); } }
-    private string AudioStatusPath { get { return Path.Combine(BaseDir, "audio.status"); } }
 
     /// <summary>Сколько секунд heartbeat считается свежим (сторож пишет его ~раз в секунду).</summary>
     private const int HeartbeatTimeoutSeconds = 20;
@@ -257,34 +255,6 @@ public class WallController
             ForeignVlcSeen = foreign,
             Note = note
         };
-    }
-
-    /// <summary>
-    /// Команда звука для сторожа. Файл пишется целиком и подменяется одним
-    /// перемещением: сторож не должен прочитать половину команды.
-    /// </summary>
-    public void SendAudioCommand(string text)
-    {
-        var tmp = AudioCmdFile + ".tmp";
-        File.WriteAllText(tmp, text ?? "", new System.Text.UTF8Encoding(false));
-        try { File.Move(tmp, AudioCmdFile, true); }
-        catch
-        {
-            try { File.Copy(tmp, AudioCmdFile, true); } catch { }
-            try { File.Delete(tmp); } catch { }
-        }
-    }
-
-    /// <summary>Состояние звука из audio.status (null — файла нет или он битый).</summary>
-    public AudioStatus ReadAudioStatus()
-    {
-        try
-        {
-            if (!File.Exists(AudioStatusPath)) return null;
-            AudioStatus st;
-            return AudioStatus.TryParse(File.ReadAllText(AudioStatusPath), out st) ? st : null;
-        }
-        catch { return null; }
     }
 
     /// <summary>PID своего VLC из vlc.pid (нужен для поиска окна стены).</summary>

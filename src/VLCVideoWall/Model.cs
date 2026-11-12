@@ -31,16 +31,6 @@ public class WallConfig
     /// </summary>
     public bool Windowed { get; set; }
 
-    /// <summary>
-    /// Имя камеры, звук которой слушаем. Пусто = звука нет.
-    /// Mosaic в VLC звук не собирает, поэтому сторож поднимает отдельный
-    /// аудиопоток этой камеры (см. watchdog.ps1).
-    /// </summary>
-    public string AudioSource { get; set; } = "";
-
-    /// <summary>Громкость звука в процентах (0..100).</summary>
-    public int Volume { get; set; } = 80;
-
     [JsonIgnore] public int Cols { get; private set; } = 2;
     [JsonIgnore] public int Rows { get; private set; } = 2;
     [JsonIgnore] public int Windows { get { return Cols * Rows; } }
@@ -78,17 +68,6 @@ public class WallConfig
             if (t.StartsWith("vlcpath") && eq > 0)
             {
                 cfg.VlcPath = t.Substring(eq + 1).Trim().Trim('"');
-                continue;
-            }
-            if (t.StartsWith("audio") && eq > 0)
-            {
-                cfg.AudioSource = t.Substring(eq + 1).Trim().Trim('"');
-                continue;
-            }
-            if (t.StartsWith("volume") && eq > 0)
-            {
-                if (int.TryParse(t.Substring(eq + 1).Trim(), out var vol))
-                    cfg.Volume = Math.Clamp(vol, 0, 100);
                 continue;
             }
             if (t.StartsWith("windowed") && eq > 0)
@@ -192,8 +171,6 @@ public class WallConfig
         sb.AppendLine("layout = " + Layout);
         sb.AppendLine("canvas = " + CanvasW + "x" + CanvasH);
         sb.AppendLine("windowed = " + (Windowed ? "yes" : "no"));
-        sb.AppendLine("audio = " + (AudioSource ?? "").Trim());
-        sb.AppendLine("volume = " + Math.Clamp(Volume, 0, 100));
         if (!string.IsNullOrWhiteSpace(VlcPath)) sb.AppendLine("vlcpath = " + VlcPath.Trim());
         if (!string.IsNullOrWhiteSpace(LogDir)) sb.AppendLine("logdir = " + LogDir.Trim());
         sb.AppendLine("logkeep = " + LogKeepDays);
@@ -223,6 +200,16 @@ public class AppSettings
     public int Height { get; set; } = 740;
     public int Left { get; set; } = -1;
     public int Top { get; set; } = -1;
+
+    /// <summary>Общая поддержка звука в стене. По умолчанию выключена.</summary>
+    public bool AudioEnabled { get; set; }
+
+    /// <summary>Громкость звука в процентах (0..100).</summary>
+    public int AudioVolume { get; set; } = 80;
+
+    /// <summary>Камеры, у которых звук включён. По умолчанию ни у одной.</summary>
+    public System.Collections.Generic.List<string> AudioChannels { get; set; }
+        = new System.Collections.Generic.List<string>();
 
     private static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
 
