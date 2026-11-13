@@ -3,6 +3,7 @@
 [Oo]bj/
 [Pp]ublish/
 dist/
+artifacts/
 *.user
 *.suo
 .vs/

@@ -121,6 +121,22 @@ dotnet publish src/VLCVideoWall/VLCVideoWall.csproj -c Release -o dist
 dotnet build src/VLCVideoWall/VLCVideoWall.csproj -c Release
 ```
 
+## Локальная проверка
+
+CI выполняется на этой машине, GitHub Actions в проекте не используется
+(хранилище артефактов Actions ограничено).
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File ci-local.ps1
+```
+
+Скрипт повторяет прежние шаги облачной сборки: проверяет комплект обязательных файлов,
+состав публикации (разрешённые документы, отсутствие служебных файлов и приватных адресов),
+собирает проект, прогоняет тесты, публикует один файл и упаковывает архив в
+`artifacts\VLCVideoWall-win-x64.zip`, после чего печатает SHA256. Ничего не уходит в сеть.
+
+Полезные ключи: `-SkipTests` — без тестов, `-Configuration Debug` — отладочная сборка.
+
 ## Состав репозитория
 
 ```
@@ -128,6 +144,8 @@ src/VLCVideoWall/          приложение на C# (WinForms, .NET 10, пу
 watchdog.ps1            сторож: генерирует VLM, управляет VLC по HTTP
 config/                 шаблон Mosaic.conf.example
 docs/                   настройка и неполадки
+ci-local.ps1            локальная проверка: сборка, тесты, архив
+tests/                  консольные тесты
 ```
 
 ## Ограничения
