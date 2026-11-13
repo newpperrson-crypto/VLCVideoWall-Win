@@ -59,6 +59,9 @@ public sealed class AudioController : IDisposable
         public int Fails;              // подряд неудачных запусков (сбрасывается только по наработке)
         public DateTime NextTry = DateTime.MinValue;
         public DateTime StartedAt = DateTime.MinValue;
+        public bool VerifyPending;     // ждём подтверждения, что звук действительно идёт
+        public DateTime VerifyAt = DateTime.MinValue;
+        public bool Verified;          // подтверждено: процесс отдаёт поток
         public AudioTrackState Track = AudioTrackState.Unknown;
         public AudioChannelState State = AudioChannelState.Off;
     }
@@ -77,12 +80,37 @@ public sealed class AudioController : IDisposable
     private readonly Task _volumeLoop;
     private int _basePort = 4213;
     private volatile bool _runtimeActive;
+    private bool _wallAudio;                  // звук идёт из потока самой стены
     private bool _disposed;
     private Task _stopTask = Task.CompletedTask;
 
     public AudioController()
     {
         _volumeLoop = Task.Run(() => VolumeLoopAsync(_volumeCts.Token));
+    }
+
+    /// <summary>
+    /// PID своего VLC стены. Нужен в режиме «звук из потока стены»: громкость
+    /// ставится сеансу этого процесса в Windows, а не отдельному VLC звука.
+    /// </summary>
+    public Func<int> WallVlcPid { get; set; }
+
+    /// <summary>
+    /// Звук берётся из того же RTSP-сеанса, что и видео: отдельные процессы не
+    /// запускаются. Так работают камеры с лимитом одного подключения — второй сеанс
+    /// они принимают, но данных не отдают, и звук молчит.
+    /// </summary>
+    public bool WallAudioMode { get { lock (_sync) return _wallAudio; } }
+
+    /// <summary>
+    /// Подходит ли режим «звук из потока стены»: одна камера на всё полотно
+    /// (сетка 1×1) и включённая поддержка звука.
+    /// </summary>
+    public static bool WallAudioFits(bool audioEnabled, string layout, int enabledCameras)
+    {
+        if (!audioEnabled) return false;
+        if (enabledCameras != 1) return false;
+        return string.Equals((layout ?? "").Trim(), "1x1", StringComparison.OrdinalIgnoreCase);
     }
 
     public bool Enabled { get; set; }          // общая поддержка звука
@@ -113,6 +141,12 @@ public sealed class AudioController : IDisposable
     {
         if (_disposed || !Enabled) return;
         _runtimeActive = true;
+        if (WallAudioMode)
+        {
+            RefreshWallStates();
+            ApplyVolumeAll();
+            return;
+        }
         StartEnabled();
     }
 
@@ -123,7 +157,83 @@ public sealed class AudioController : IDisposable
     public void DeactivateRuntime()
     {
         _runtimeActive = false;
+        if (WallAudioMode)
+        {
+            MuteWall();
+            RefreshWallStates();
+            return;
+        }
         _stopTask = Task.Run(() => StopAllProcesses());
+    }
+
+    // ---------------------------------------------------------------- звук из потока стены
+
+    /// <summary>
+    /// Включить или выключить режим «звук из потока стены». При включении отдельные
+    /// процессы звука гасятся: их место занимает сам VLC стены.
+    /// </summary>
+    public void SetWallAudio(bool on)
+    {
+        lock (_sync)
+        {
+            if (_wallAudio == on) return;
+            _wallAudio = on;
+            if (on)
+            {
+                foreach (var ch in _channels.Values) KillChannelBlocking(ch);
+            }
+            foreach (var ch in _channels.Values)
+            {
+                ch.Starting = false;
+                ch.Fails = 0;
+                ch.NextTry = DateTime.MinValue;
+                ch.State = AudioChannelState.Off;
+            }
+        }
+        if (on) AudioPlaylist.DeleteAll();
+        RaiseChanged();
+    }
+
+    /// <summary>Состояние каналов по факту: стена играет, дорожка есть, звук не выключен.</summary>
+    private void RefreshWallStates()
+    {
+        bool active = _runtimeActive && Enabled;
+        int pid = 0;
+        var pidFn = WallVlcPid;
+        if (active && pidFn != null)
+        {
+            try { pid = pidFn(); } catch { pid = 0; }
+        }
+
+        bool changed = false;
+        lock (_sync)
+        {
+            foreach (var ch in _channels.Values)
+            {
+                var want = ch.On && pid > 0 && ch.Track != AudioTrackState.Absent
+                    ? AudioChannelState.Playing
+                    : AudioChannelState.Off;
+                if (ch.State != want)
+                {
+                    ch.State = want;
+                    changed = true;
+                }
+            }
+        }
+        if (changed) RaiseChanged();
+    }
+
+    /// <summary>Выключить звук стены, не трогая пользовательскую настройку камер.</summary>
+    private void MuteWall()
+    {
+        var pidFn = WallVlcPid;
+        int pid = 0;
+        if (pidFn != null)
+        {
+            try { pid = pidFn(); } catch { pid = 0; }
+        }
+        if (pid <= 0) return;
+        Task.Run(() => ProcessVolume.SetVolume((uint)pid, 0f));
     }
 
     /// <summary>Дождаться фактического завершения процессов (после DeactivateRuntime).</summary>
@@ -137,6 +247,7 @@ public sealed class AudioController : IDisposable
     {
         _disposed = true;
         _runtimeActive = false;
+        if (_wallAudio) MuteWall();
         try { _volumeCts.Cancel(); } catch { }
         StopAllProcesses();
         try { _volumeCts.Dispose(); } catch { }
@@ -351,6 +462,7 @@ public sealed class AudioController : IDisposable
     public bool Toggle(string name, bool startProcess = true)
     {
         bool wantOn;
+        bool wall;
         lock (_sync)
         {
             Channel ch;
@@ -363,14 +475,30 @@ public sealed class AudioController : IDisposable
             ch.On = wantOn;
             ch.Fails = 0;
             ch.NextTry = DateTime.MinValue;
-            ch.State = wantOn ? AudioChannelState.Starting : AudioChannelState.Off;
-            if (startProcess && wantOn && _runtimeActive && Enabled) ch.Starting = true;
+            wall = _wallAudio;
+            if (wall)
+            {
+                ch.Starting = false;
+                ch.State = AudioChannelState.Off;      // состояние уточнит RefreshWallStates
+            }
+            else
+            {
+                ch.State = wantOn ? AudioChannelState.Starting : AudioChannelState.Off;
+                if (startProcess && wantOn && _runtimeActive && Enabled) ch.Starting = true;
+            }
         }
 
         RaiseChanged();
 
         if (!startProcess) return true;
         if (!_runtimeActive || !Enabled) return true;      // стена стоит — только запомнили
+
+        if (wall)
+        {
+            ApplyVolumeAll();          // звук стены: включили — вернули громкость, выключили — 0
+            RefreshWallStates();
+            return true;
+        }
 
         if (wantOn) Task.Run(() => StartChannel(name));
         else Task.Run(() => { StopChannel(name); RaiseChanged(); });
@@ -381,6 +509,7 @@ public sealed class AudioController : IDisposable
     public void StartEnabled()
     {
         if (_disposed || !Enabled || !_runtimeActive) return;
+        if (WallAudioMode) { RefreshWallStates(); ApplyVolumeAll(); return; }
 
         var start = new List<string>();
         lock (_sync)
@@ -407,8 +536,10 @@ public sealed class AudioController : IDisposable
     public void Tick()
     {
         if (_disposed || !Enabled || !_runtimeActive) return;
+        if (WallAudioMode) { RefreshWallStates(); return; }
 
         var start = new List<string>();
+        var verify = new List<string>();
         bool changed = false;
 
         lock (_sync)
@@ -423,6 +554,8 @@ public sealed class AudioController : IDisposable
                         ch.State = AudioChannelState.Playing;
                         changed = true;
                     }
+                    if (ch.VerifyPending && ch.VerifyAt != DateTime.MinValue && DateTime.UtcNow >= ch.VerifyAt)
+                        verify.Add(ch.Name);
                     // устойчивая работа — только теперь сбрасываем счётчик неудач
                     if (ch.Fails > 0 && ch.StartedAt != DateTime.MinValue &&
                         (DateTime.UtcNow - ch.StartedAt).TotalSeconds >= StableSeconds)
@@ -466,6 +599,81 @@ public sealed class AudioController : IDisposable
 
         if (changed) RaiseChanged();
         foreach (var n in start) Task.Run(() => StartChannel(n));
+        foreach (var n in verify) Task.Run(() => VerifyChannelAsync(n));
+    }
+
+    /// <summary>
+    /// Проверка, что звук канала действительно идёт. Процесс VLC может быть жив, а потока
+    /// нет: камера с лимитом одного подключения принимает вторую сессию и молчит —
+    /// тогда VLC останавливает воспроизведение, а значок показывал «включено».
+    /// </summary>
+    private async Task VerifyChannelAsync(string name)
+    {
+        int port;
+        string password;
+        lock (_sync)
+        {
+            Channel ch;
+            if (!_channels.TryGetValue(name, out ch)) return;
+            if (ch.Proc == null || SafeExited(ch.Proc) || !ch.VerifyPending) return;
+            port = ch.Port;
+            password = ch.Password;
+        }
+
+        bool playing = false;
+        try
+        {
+            var url = "http://127.0.0.1:" + port + "/requests/status.xml";
+            using (var req = new HttpRequestMessage(HttpMethod.Get, url))
+            {
+                var auth = Convert.ToBase64String(Encoding.UTF8.GetBytes(":" + password));
+                req.Headers.Authorization = new AuthenticationHeaderValue("Basic", auth);
+                using (var resp = await _http.SendAsync(req).ConfigureAwait(false))
+                {
+                    var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    playing = body.IndexOf("<state>playing</state>", StringComparison.OrdinalIgnoreCase) >= 0;
+                }
+            }
+        }
+        catch { playing = false; }
+
+        if (playing)
+        {
+            lock (_sync)
+            {
+                Channel ch;
+                if (_channels.TryGetValue(name, out ch))
+                {
+                    ch.VerifyPending = false;
+                    ch.Verified = true;
+                }
+            }
+            return;
+        }
+
+        bool changed = false;
+        lock (_sync)
+        {
+            Channel ch;
+            if (!_channels.TryGetValue(name, out ch)) return;
+            ch.VerifyPending = false;
+            ch.Verified = false;
+            KillChannelBlocking(ch);
+            ch.Fails++;
+            if (ch.Fails > MaxFails)
+            {
+                ch.State = AudioChannelState.Failed;
+            }
+            else
+            {
+                int delay = BackoffSeconds[Math.Min(ch.Fails - 1, BackoffSeconds.Length - 1)];
+                ch.NextTry = DateTime.UtcNow.AddSeconds(delay);
+                ch.State = AudioChannelState.Recovering;
+            }
+            changed = true;
+        }
+        LastError = "камера " + name + " не отдала звук: возможно, её единственное подключение занято стеной";
+        if (changed) RaiseChanged();
     }
 
     // ---------------------------------------------------------------- процессы
@@ -479,7 +687,7 @@ public sealed class AudioController : IDisposable
         lock (_sync)
         {
             if (!_channels.TryGetValue(name, out ch)) return;
-            if (_disposed || !Enabled || !_runtimeActive || !ch.On || ch.StopUnconfirmed)
+            if (_disposed || !Enabled || !_runtimeActive || !ch.On || ch.StopUnconfirmed || _wallAudio)
             {
                 ch.Starting = false;
                 ch.State = AudioChannelState.Off;
@@ -564,6 +772,11 @@ public sealed class AudioController : IDisposable
                 ch.StartedAt = DateTime.UtcNow;
                 ch.State = AudioChannelState.Playing;
                 ch.VolumeDirty = true;
+                // через ~12 с проверим, что процесс действительно отдаёт поток:
+                // «процесс жив» ещё не значит «звук идёт»
+                ch.VerifyPending = true;
+                ch.Verified = false;
+                ch.VerifyAt = DateTime.UtcNow.AddSeconds(12);
                 // Fails НЕ сбрасываем: успешный старт процесса ещё не значит, что звук идёт
             }
             LastError = "";
@@ -732,7 +945,11 @@ public sealed class AudioController : IDisposable
 
     public int PlayingCount()
     {
-        lock (_sync) return _channels.Values.Count(c => c.Proc != null && !SafeExited(c.Proc));
+        lock (_sync)
+        {
+            if (_wallAudio) return _channels.Values.Count(c => c.State == AudioChannelState.Playing);
+            return _channels.Values.Count(c => c.Proc != null && !SafeExited(c.Proc));
+        }
     }
 
     private static bool SafeExited(Process p)
@@ -749,10 +966,29 @@ public sealed class AudioController : IDisposable
 
     public void ApplyVolumeAll()
     {
+        if (WallAudioMode) { PushWallVolume(); return; }
         lock (_sync)
         {
             foreach (var ch in _channels.Values) ch.VolumeDirty = true;
         }
+    }
+
+    /// <summary>Громкость стены: 0 — звук выключен, иначе заданный уровень.</summary>
+    private void PushWallVolume()
+    {
+        var pidFn = WallVlcPid;
+        int pid = 0;
+        if (pidFn != null)
+        {
+            try { pid = pidFn(); } catch { pid = 0; }
+        }
+        if (pid <= 0) return;
+
+        bool anyOn;
+        lock (_sync) anyOn = _channels.Values.Any(c => c.On);
+        float level = anyOn ? (float)(Math.Clamp(Volume, 0, 100) / 100.0) : 0f;
+        uint id = (uint)pid;
+        Task.Run(() => ProcessVolume.SetVolume(id, level));
     }
 
     /// <summary>

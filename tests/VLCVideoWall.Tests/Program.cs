@@ -55,6 +55,7 @@ internal static class Program
 
         Console.WriteLine("порты звука:");
         AudioPorts();
+        WallAudioMode();
 
         Console.WriteLine("RTSP-проверка:");
         ProbeBasicOk();
@@ -216,6 +217,40 @@ internal static class Program
     private static Camera Cam(string name, string url, bool on = true)
     {
         return new Camera { Name = name, Url = url, Enabled = on };
+    }
+
+    /// <summary>
+    /// Режим «звук из потока стены»: одна камера на всё полотно. Камеры с лимитом
+    /// одного RTSP-подключения отдают звук только так, второй процесс остаётся немым.
+    /// </summary>
+    private static void WallAudioMode()
+    {
+        Check(AudioController.WallAudioFits(true, "1x1", 1), "1×1 и одна камера — звук из потока стены");
+        Check(!AudioController.WallAudioFits(false, "1x1", 1), "без поддержки звука режим не включается");
+        Check(!AudioController.WallAudioFits(true, "2x2", 4), "сетка 2×2 — отдельные процессы звука");
+        Check(!AudioController.WallAudioFits(true, "1x1", 2), "две камеры — отдельные процессы звука");
+        Check(!AudioController.WallAudioFits(true, "1x1", 0), "без камер режим не включается");
+        Check(AudioController.WallAudioFits(true, " 1X1 ", 1), "регистр и пробелы в раскладке не мешают");
+
+        using (var audio = new AudioController())
+        {
+            audio.SetCameras(new[] { Cam("A", "rtsp://192.0.2.1/a") });
+            audio.Enabled = true;
+            audio.SetWallAudio(true);
+            Check(audio.WallAudioMode, "режим стены включён");
+
+            audio.ActivateRuntime();
+            Check(audio.PlayingCount() == 0, "в режиме стены отдельный процесс не поднимается");
+            Check(audio.State("A") == AudioChannelState.Off, "без VLC стены канал не считается играющим");
+
+            Check(audio.Toggle("A", true), "переключение в режиме стены принимается");
+            Check(audio.IsOn("A"), "выбор камеры сохраняется");
+            Check(audio.PlayingCount() == 0, "после переключения процесса тоже нет");
+
+            audio.SetWallAudio(false);
+            Check(!audio.WallAudioMode, "режим стены выключается");
+            Check(audio.IsOn("A"), "выключение режима не теряет выбор камеры");
+        }
     }
 
     private static void AudioPorts()

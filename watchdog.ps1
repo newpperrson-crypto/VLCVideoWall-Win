@@ -11,7 +11,8 @@
 
 param(
     [int]$WallPort = 0,    # локальный HTTP-порт VLC стены (0 = из Mosaic.conf или 4212)
-    [int]$GuardPort = 0    # локальный порт сторожа (0 = из Mosaic.conf или 42130)
+    [int]$GuardPort = 0,   # локальный порт сторожа (0 = из Mosaic.conf или 42130)
+    [switch]$AudioFromWall # звук берём из потока стены (одна камера), без отдельного VLC
 )
 
 $ErrorActionPreference = 'Continue'
@@ -46,6 +47,10 @@ $LOCK_PORT         = 42130 # защита от второго экземпляр
 # порты из параметров запуска: приложение передаёт их при старте сторожа
 if ($WallPort -ge 1024 -and $WallPort -le 65535) { $HTTP_PORT = $WallPort }
 if ($GuardPort -ge 1024 -and $GuardPort -le 65535) { $LOCK_PORT = $GuardPort }
+# звук из потока стены: приложение включает это, когда на полотне одна камера.
+# Тогда VLM выводит поток напрямую (видео и звук в одном RTSP-сеансе) — иначе
+# камеры с лимитом одного подключения отдают звук второму процессу пустым.
+$script:AUDIO_FROM_WALL = [bool]$AudioFromWall
 $PROBE_OK_INTERVAL   = 5    # опрос камеры, когда она не отвечает по сети
 $PROBE_SLOW_INTERVAL = 60   # порт открыт, но RTSP молчит
 $PROBE_AUTH_INTERVAL = 120  # 401/403: не чаще раза в 2 минуты, иначе камера банит IP
@@ -187,6 +192,17 @@ function Read-MosaicConf([string]$path) {
     }
 }
 
+function Write-VlmText([string]$path, [string]$text) {
+    # перезаписываем файл только при фактическом изменении
+    $old = $null
+    if (Test-Path -LiteralPath $path) {
+        try { $old = Get-Content -LiteralPath $path -Raw -Encoding UTF8 } catch { }
+    }
+    if ($old -ne $text) {
+        [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
+    }
+}
+
 function Write-MosaicVlm([string]$path, $conf) {
     # Собирает Mosaic.active.vlm под нужную сетку: cols x rows из Mosaic.conf
     $parts = $conf.Layout -split 'x'
@@ -201,6 +217,28 @@ function Write-MosaicVlm([string]$path, $conf) {
     $tw = [math]::Floor($cw / $cols / 2) * 2
     $th = [math]::Floor($chh / $rows / 2) * 2
     [void](Ensure-Background -file $conf.BgFile -w $cw -h $chh)
+
+    # Звук из потока стены: на полотне одна камера — выводим её напрямую, без мозаики
+    # и без «no-audio». Видео и звук идут из одного RTSP-сеанса, поэтому камеры с
+    # лимитом одного подключения тоже дают звук (второй сеанс они не отдают).
+    if ($script:AUDIO_FROM_WALL -and $use.Count -eq 1 -and ($cols * $rows) -le 1) {
+        $d = New-Object System.Text.StringBuilder
+        [void]$d.AppendLine('del all')
+        [void]$d.AppendLine('')
+        [void]$d.AppendLine('# собрано автоматически из Mosaic.conf: одна камера, звук из того же потока')
+        [void]$d.AppendLine('')
+        [void]$d.AppendLine(('new {0} broadcast enabled' -f $use[0].Name))
+        [void]$d.AppendLine(('setup {0} input "{1}"' -f $use[0].Name, $use[0].Url))
+        [void]$d.AppendLine(('setup {0} option rtsp-tcp' -f $use[0].Name))
+        [void]$d.AppendLine(('setup {0} option network-caching=1500' -f $use[0].Name))
+        [void]$d.AppendLine(('setup {0} option sout-keep' -f $use[0].Name))
+        [void]$d.AppendLine(('setup {0} output #display' -f $use[0].Name))
+        [void]$d.AppendLine('')
+        [void]$d.AppendLine(('control {0} play' -f $use[0].Name))
+        [void]$d.AppendLine('')
+        Write-VlmText -path $path -text $d.ToString()
+        return $use
+    }
 
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('del all')
@@ -228,13 +266,7 @@ function Write-MosaicVlm([string]$path, $conf) {
     [void]$sb.AppendLine('')
 
     $text = $sb.ToString()
-    $old = $null
-    if (Test-Path -LiteralPath $path) {
-        try { $old = Get-Content -LiteralPath $path -Raw -Encoding UTF8 } catch { }
-    }
-    if ($old -ne $text) {
-        [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
-    }
+    Write-VlmText -path $path -text $text
     return $use
 }
 
@@ -775,6 +807,11 @@ function Invoke-Watchdog {
     }
     $addr = ($channels | ForEach-Object { '{0}={1}:{2}' -f $_.Name, $_.HostName, $_.Port }) -join '; '
     Write-Log ('адреса: {0}' -f $addr)
+    if ($script:AUDIO_FROM_WALL -and $channels.Count -eq 1) {
+        Write-Log 'звук: из потока стены (одна камера, отдельный процесс не нужен)'
+    } elseif ($script:AUDIO_FROM_WALL) {
+        Write-Log ('звук из потока стены невозможен: камер {0} — нужна одна, вывожу мозаику как обычно' -f $channels.Count)
+    }
 
     $script:CAMERAS = @($channels)
 

@@ -43,6 +43,12 @@ public class MainForm : Form
     private System.Windows.Forms.Timer _audioTimer;
     private CheckBox _chkAudio;
     private NumericUpDown _numAudioVolume;
+
+    /// <summary>Режим звука, с которым запущена стена (задаётся при старте).</summary>
+    private bool _wallAudioActive;
+
+    /// <summary>Нужен перезапуск стены, чтобы включился звук из её потока.</summary>
+    private bool _wallAudioRestartNeeded;
     private Label _audioHint;
     private Label _portHint;
     private ComboBox _cmbBadgeCorner;
@@ -122,6 +128,8 @@ public class MainForm : Form
         // значки звука поверх плиток: отдельные окна, потому что VLC рисует мозаику полотном
         _wallBadges.Toggled += pos => ToggleAudioByIndex(pos);
         _audio.Changed += RefreshAudioUi;
+        // громкость в режиме «звук из потока стены» ставится сеансу нашего VLC в Windows
+        _audio.WallVlcPid = () => _wall.OwnVlcPid();
         _audioTimer = new System.Windows.Forms.Timer { Interval = 700 };
         _audioTimer.Tick += (s, e) =>
         {
@@ -865,10 +873,26 @@ public class MainForm : Form
 
         if (!_audio.Enabled)
         {
+            // сначала гасим звук (в режиме стены это mute её процесса), потом меняем режим:
+            // иначе DeactivateRuntime уже не знает, что глушить надо стену
             _audio.DeactivateRuntime();
+            _audio.SetWallAudio(false);
         }
         else
         {
+            int cams = _cameras.Count(c => c.Enabled && !string.IsNullOrWhiteSpace(c.Url));
+            bool desired = AudioController.WallAudioFits(true, _cfg.Layout, cams);
+            if (_wall.IsRunning && desired != _wallAudioActive && desired)
+            {
+                // режим звука задаётся при запуске стены: без перезапуска он не включится
+                _wallAudioRestartNeeded = true;
+            }
+            else
+            {
+                _audio.SetWallAudio(desired && _wallAudioActive);
+                _wallAudioRestartNeeded = false;
+            }
+
             // движок включаем только у работающей стены: на остановленной звук не стартует
             if (_wall.IsRunning) _audio.ActivateRuntime();
             else _audio.DeactivateRuntime();
@@ -993,6 +1017,7 @@ public class MainForm : Form
 
         int failed = _audio.FailedCount();
         if (failed > 0) text += " · не удалось запустить: " + failed;
+        if (_wallAudioRestartNeeded) text += " · звук включится после перезапуска стены";
         _audioHint.Text = text;
     }
 
@@ -1370,7 +1395,16 @@ public class MainForm : Form
             _wall.GuardPort = _cfg.PortGuard;
 
             SetBusy(true);
-            await _wall.StartAsync();
+
+            // Звук из потока стены: одна камера на всё полотно. Так камеры с лимитом
+            // одного подключения отдают звук — второй сеанс они принимают и молчат.
+            bool wallAudio = AudioController.WallAudioFits(
+                _audio.Enabled, _cfg.Layout, _cameras.Count(c => c.Enabled && !string.IsNullOrWhiteSpace(c.Url)));
+            _audio.SetWallAudio(wallAudio);
+            _wallAudioActive = wallAudio;
+            _wallAudioRestartNeeded = false;
+
+            await _wall.StartAsync(wallAudio);
 
             var sw = Stopwatch.StartNew();
             while (sw.ElapsedMilliseconds < 6000 && !_wall.IsGuardAlive()) await Task.Delay(200);
@@ -1439,6 +1473,8 @@ public class MainForm : Form
             _audio.DeactivateRuntime();                 // запрещаем восстановление до остановки
             try { await _audio.WaitStoppedAsync(6000); } catch { }
             _audio.ResetTracks();     // на остановленной стене состояние дорожек неизвестно
+            _wallAudioActive = false; // режим звука задаётся заново при следующем запуске
+            _wallAudioRestartNeeded = false;
             SetBusy(false);
             UpdateStatus();
             UpdateWallBadges();

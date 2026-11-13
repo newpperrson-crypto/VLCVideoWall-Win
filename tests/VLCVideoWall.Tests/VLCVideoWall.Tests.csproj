@@ -15,6 +15,7 @@
   <ItemGroup>
     <Compile Include="..\..\src\VLCVideoWall\Model.cs" Link="Model.cs" />
     <Compile Include="..\..\src\VLCVideoWall\AudioController.cs" Link="AudioController.cs" />
+    <Compile Include="..\..\src\VLCVideoWall\ProcessVolume.cs" Link="ProcessVolume.cs" />
     <Compile Include="..\..\src\VLCVideoWall\AudioPlaylist.cs" Link="AudioPlaylist.cs" />
     <Compile Include="..\..\src\VLCVideoWall\VlcLocator.cs" Link="VlcLocator.cs" />
     <Compile Include="..\..\src\VLCVideoWall\RtspProbe.cs" Link="RtspProbe.cs" />
