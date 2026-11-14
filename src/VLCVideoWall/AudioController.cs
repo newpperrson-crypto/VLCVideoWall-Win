@@ -636,8 +636,13 @@ public sealed class AudioController : IDisposable
     /// Проверка, что звук канала действительно идёт. Процесс VLC может быть жив, а потока
     /// нет: камера с лимитом одного подключения принимает вторую сессию и молчит —
     /// тогда VLC останавливает воспроизведение, а значок показывал «включено».
+    ///
+    /// Одиночная неудачная проверка не убивает канал: живой поток над локальной копией
+    /// бывает в состоянии «открывается» доли секунды, и раньше это выглядело как сбой —
+    /// процесс гасился и поднимался заново без причины. Гасим только после двух
+    /// подряд неудач с паузой, и «открывается/буферизуется» считаем рабочим.
     /// </summary>
-    private async Task VerifyChannelAsync(string name)
+    private async Task VerifyChannelAsync(string name, bool secondTry = false)
     {
         int port;
         string password;
@@ -650,7 +655,8 @@ public sealed class AudioController : IDisposable
             password = ch.Password;
         }
 
-        bool playing = false;
+        string state = "";
+        bool answered = false;
         try
         {
             var url = "http://127.0.0.1:" + port + "/requests/status.xml";
@@ -661,13 +667,23 @@ public sealed class AudioController : IDisposable
                 using (var resp = await _http.SendAsync(req).ConfigureAwait(false))
                 {
                     var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
-                    playing = body.IndexOf("<state>playing</state>", StringComparison.OrdinalIgnoreCase) >= 0;
+                    var m = System.Text.RegularExpressions.Regex.Match(body, "<state>([a-zA-Z]+)</state>");
+                    if (m.Success)
+                    {
+                        state = m.Groups[1].Value;
+                        answered = true;
+                    }
                 }
             }
         }
-        catch { playing = false; }
+        catch { }
 
-        if (playing)
+        bool ok = answered &&
+                  (state.Equals("playing", StringComparison.OrdinalIgnoreCase) ||
+                   state.Equals("opening", StringComparison.OrdinalIgnoreCase) ||
+                   state.Equals("buffering", StringComparison.OrdinalIgnoreCase));
+
+        if (ok)
         {
             lock (_sync)
             {
@@ -678,6 +694,14 @@ public sealed class AudioController : IDisposable
                     ch.Verified = true;
                 }
             }
+            return;
+        }
+
+        if (!secondTry)
+        {
+            // вторая попытка через паузу: живой поток успевает выйти из «открывается»
+            await Task.Delay(3500).ConfigureAwait(false);
+            await VerifyChannelAsync(name, true).ConfigureAwait(false);
             return;
         }
 

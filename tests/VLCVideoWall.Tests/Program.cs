@@ -53,6 +53,18 @@ internal static class Program
         Check(loaded.AudioBadgeCorner == "top-left", "угол значка сохраняется");
         try { File.Delete(settingsPath); } catch { }
 
+        // файл с BOM (так пишет PowerShell) не должен превращаться в настройки по умолчанию:
+        // иначе выключенный звук выглядит как «звук пропал»
+        var bomPath = Path.Combine(Path.GetTempPath(), "vw-bom-" + Guid.NewGuid().ToString("N") + ".json");
+        var json = "{\"AudioEnabled\":true,\"AudioVolume\":55,\"AudioChannels\":[\"ch2\"],\"RelayAudio\":true}";
+        File.WriteAllText(bomPath, json, new UTF8Encoding(true));
+        var fromBom = AppSettings.Load(bomPath);
+        Check(fromBom.AudioEnabled, "настройки с BOM читаются: поддержка звука включена");
+        Check(fromBom.AudioVolume == 55, "настройки с BOM читаются: громкость");
+        Check(fromBom.AudioChannels.Contains("ch2"), "настройки с BOM читаются: включённые камеры");
+        Check(fromBom.RelayAudio, "настройки с BOM читаются: локальная копия");
+        try { File.Delete(bomPath); } catch { }
+
         Console.WriteLine("порты звука:");
         AudioPorts();
         WallAudioMode();

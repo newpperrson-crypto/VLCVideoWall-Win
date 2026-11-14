@@ -55,7 +55,7 @@ public class WallConfig
 
         foreach (var raw in File.ReadAllLines(path, Encoding.UTF8))
         {
-            var t = raw.Trim();
+            var t = raw.Trim().TrimStart('\uFEFF');
             if (t.Length == 0 || t.StartsWith("#")) continue;
 
             var eq = t.IndexOf('=');
@@ -260,7 +260,14 @@ public class AppSettings
         try
         {
             if (File.Exists(path))
-                return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path)) ?? new AppSettings();
+            {
+                // файл мог быть сохранён другой программой (или PowerShell) с BOM:
+                // JsonSerializer на строке с BOM падает, а настройки при этом молча
+                // заменяются значениями по умолчанию — то есть выключенным звуком
+                var text = File.ReadAllText(path).TrimStart('\uFEFF', ' ', '\r', '\n', '\t');
+                if (text.Length == 0) return new AppSettings();
+                return JsonSerializer.Deserialize<AppSettings>(text) ?? new AppSettings();
+            }
         }
         catch { }
         return new AppSettings();
