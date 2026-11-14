@@ -246,6 +246,13 @@ public class AppSettings
     public System.Collections.Generic.List<string> AudioChannels { get; set; }
         = new System.Collections.Generic.List<string>();
 
+    /// <summary>
+    /// Звук через локальную копию потока: камеру читает один процесс, стена и звук
+    /// берут видео и звук из этой копии. Нужно камерам, которые разрешают только одно
+    /// подключение. По умолчанию выключено (лишняя пересылка не всем нужна).
+    /// </summary>
+    public bool RelayAudio { get; set; }
+
     private static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
 
     public static AppSettings Load(string path)

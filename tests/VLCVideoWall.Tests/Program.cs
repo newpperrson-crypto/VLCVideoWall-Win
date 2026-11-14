@@ -271,6 +271,12 @@ internal static class Program
             Check(audio.State("A") == AudioChannelState.Playing, "видимая камера — звук включён");
             Check(audio.State("B") == AudioChannelState.Off, "невидимая камера звуком стены не управляет");
         }
+
+        // порты локальной копии: сразу за диапазоном звука, по номеру окна
+        Check(AudioController.RelayPortFor(4213, 0) == 4229, "локальная копия первой камеры — 4229");
+        Check(AudioController.RelayPortFor(4213, 15) == 4244, "локальная копия 16-й камеры — 4244");
+        Check(AudioController.RelayPortFor(4313, 0) == 4329, "смена базового порта сдвигает и копии");
+        Check(AudioController.RelayPortFor(4213, 0) > 4213 + 15, "порты копий не пересекаются со звуком");
     }
 
     private static void AudioPorts()

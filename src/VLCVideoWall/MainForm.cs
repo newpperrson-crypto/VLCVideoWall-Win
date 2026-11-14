@@ -42,6 +42,7 @@ public class MainForm : Form
     private readonly WallAudioBadges _wallBadges = new WallAudioBadges();
     private System.Windows.Forms.Timer _audioTimer;
     private CheckBox _chkAudio;
+    private CheckBox _chkRelay;
     private NumericUpDown _numAudioVolume;
 
     /// <summary>Режим звука, с которым запущена стена (задаётся при старте).</summary>
@@ -49,6 +50,12 @@ public class MainForm : Form
 
     /// <summary>Нужен перезапуск стены, чтобы включился звук из её потока.</summary>
     private bool _wallAudioRestartNeeded;
+
+    /// <summary>Режим локальной копии потока, с которым запущена стена.</summary>
+    private bool _relayActive;
+
+    /// <summary>Нужен перезапуск стены, чтобы включилась локальная копия потока.</summary>
+    private bool _relayRestartNeeded;
     private Label _audioHint;
     private Label _portHint;
     private ComboBox _cmbBadgeCorner;
@@ -550,6 +557,18 @@ public class MainForm : Form
         _audioHint = new Label { AutoSize = true, ForeColor = Color.FromArgb(93, 107, 127), Margin = new Padding(18, 8, 0, 0) };
         audioRow.Controls.Add(_audioHint);
 
+        // камера, разрешающая одно подключение, не отдаёт звук вторым процессом:
+        // тогда камеру читает один коллектор, а стена и звук берут её локальную копию
+        var relayRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 4, 0, 0) };
+        _chkRelay = new CheckBox
+        {
+            Text = "Звук через локальную копию потока (камеры с одним подключением)",
+            AutoSize = true,
+            Margin = new Padding(0, 4, 0, 0)
+        };
+        _chkRelay.CheckedChanged += (s, e) => OnRelayChanged();
+        relayRow.Controls.Add(_chkRelay);
+
         // положение значка звука
         var cornerRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 6, 0, 0) };
         cornerRow.Controls.Add(new Label { Text = "значок звука", AutoSize = true, Margin = new Padding(0, 8, 8, 0) });
@@ -575,7 +594,7 @@ public class MainForm : Form
         _portHint = new Label { AutoSize = true, ForeColor = Color.FromArgb(93, 107, 127), Margin = new Padding(14, 8, 0, 0) };
         portRow.Controls.Add(_portHint);
 
-        fl.Controls.AddRange(new Control[] { vlcPanel, _chkAutoApp, _chkAutoWall, _chkTrayMin, _chkTrayClose, _chkTopMost, audioRow, cornerRow, portRow, hint });
+        fl.Controls.AddRange(new Control[] { vlcPanel, _chkAutoApp, _chkAutoWall, _chkTrayMin, _chkTrayClose, _chkTopMost, audioRow, relayRow, cornerRow, portRow, hint });
         page.Controls.Add(fl);
         return page;
     }
@@ -723,6 +742,7 @@ public class MainForm : Form
             UpdatePortHint();
 
             _chkAudio.Checked = _app.AudioEnabled;
+            _chkRelay.Checked = _app.RelayAudio;
             if (_numAudioVolume != null) _numAudioVolume.Value = Math.Clamp(_app.AudioVolume, 0, 100);
             _audio.Enabled = _app.AudioEnabled;
             _audio.Volume = Math.Clamp(_app.AudioVolume, 0, 100);
@@ -863,6 +883,19 @@ public class MainForm : Form
 
         SaveAudioState();
         RefreshAudioUi();          // сразу показываем «принято» — значок становится Busy
+    }
+
+    /// <summary>
+    /// Локальная копия потока включена/выключена в «Общих настройках». Режим задаётся
+    /// при запуске стены, поэтому на работающей стене он применится после перезапуска.
+    /// </summary>
+    private void OnRelayChanged()
+    {
+        if (_loading) return;
+        _app.RelayAudio = _chkRelay.Checked;
+        try { _app.Save(_settingsPath); } catch { }
+        _relayRestartNeeded = _wall.IsRunning && _app.RelayAudio != _relayActive;
+        UpdateAudioHint();
     }
 
     /// <summary>Поддержка звука переключена в «Общих настройках».</summary>
@@ -1019,6 +1052,7 @@ public class MainForm : Form
         int failed = _audio.FailedCount();
         if (failed > 0) text += " · не удалось запустить: " + failed;
         if (_wallAudioRestartNeeded) text += " · звук включится после перезапуска стены";
+        if (_relayRestartNeeded) text += " · локальная копия потока применится после перезапуска стены";
         _audioHint.Text = text;
     }
 
@@ -1399,13 +1433,18 @@ public class MainForm : Form
 
             // Звук из потока стены: одна камера на всё полотно. Так камеры с лимитом
             // одного подключения отдают звук — второй сеанс они принимают и молчат.
-            bool wallAudio = AudioController.WallAudioFits(
+            // Локальная копия потока решает то же для любой сетки, поэтому она главнее.
+            bool relay = _app.RelayAudio;
+            _audio.RelayMode = relay;
+            _relayActive = relay;
+            _relayRestartNeeded = false;
+            bool wallAudio = !relay && AudioController.WallAudioFits(
                 _audio.Enabled, _cfg.Layout, _cameras.Count(c => c.Enabled && !string.IsNullOrWhiteSpace(c.Url)));
             _audio.SetWallAudio(wallAudio);
             _wallAudioActive = wallAudio;
             _wallAudioRestartNeeded = false;
 
-            await _wall.StartAsync(wallAudio);
+            await _wall.StartAsync(wallAudio, relay);
 
             var sw = Stopwatch.StartNew();
             while (sw.ElapsedMilliseconds < 6000 && !_wall.IsGuardAlive()) await Task.Delay(200);

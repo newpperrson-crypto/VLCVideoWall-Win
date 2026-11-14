@@ -109,6 +109,28 @@ public sealed class AudioController : IDisposable
     public int VisibleCount { get; set; } = int.MaxValue;
 
     /// <summary>
+    /// Звук читается из локальной копии потока (её держит сторож), а не с камеры:
+    /// камера с одним разрешённым подключением отдаёт видео и звук из одного сеанса.
+    /// </summary>
+    public bool RelayMode { get; set; }
+
+    /// <summary>Адрес, который читает звуковой процесс.</summary>
+    private string InputUrl(Channel ch)
+    {
+        if (RelayMode) return "http://127.0.0.1:" + RelayPortFor(_basePort, ch.Order);
+        return ch.Url;
+    }
+
+    /// <summary>
+    /// Порт локальной копии потока для камеры: сразу за диапазоном звука, по номеру окна.
+    /// Такой же расчёт делает сторож, когда поднимает локальные копии.
+    /// </summary>
+    public static int RelayPortFor(int basePort, int order)
+    {
+        return basePort + PortSpan + order;
+    }
+
+    /// <summary>
     /// Подходит ли режим «звук из потока стены»: полотно состоит из одной плитки
     /// (сетка 1×1), поэтому стена показывает ровно одну камеру. Сколько камер при этом
     /// в списке — неважно: на полотне всё равно первая, остальные ждут своей сетки.
@@ -690,6 +712,7 @@ public sealed class AudioController : IDisposable
     {
         Channel ch;
         int port;
+        int waitForRelayPort = 0;
         string url, password;
 
         lock (_sync)
@@ -707,6 +730,13 @@ public sealed class AudioController : IDisposable
                 ch.State = AudioChannelState.Off;
                 return;
             }
+            // локальная копия может ещё не отдавать поток: подождём её (это фоновая
+            // задача, интерфейс не блокируется), иначе VLC откроет мёртвый адрес
+            if (RelayMode)
+            {
+                int relayPort = RelayPortFor(_basePort, ch.Order);
+                waitForRelayPort = relayPort;
+            }
             if (ch.Proc != null && !SafeExited(ch.Proc))
             {
                 ch.Starting = false;
@@ -716,8 +746,32 @@ public sealed class AudioController : IDisposable
             }
 
             port = ch.Port;
-            url = ch.Url;
+            url = InputUrl(ch);
             password = ch.Password;
+        }
+
+        // ждём готовности локальной копии уже без блокировки: канал ещё в состоянии
+        // «запускается», ничего не считается сбоем
+        if (waitForRelayPort > 0)
+        {
+            var waitRelay = Stopwatch.StartNew();
+            while (!IsPortOpen(waitForRelayPort, 250) && waitRelay.ElapsedMilliseconds < 8000)
+            {
+                if (_disposed || !_runtimeActive)
+                {
+                    lock (_sync)
+                    {
+                        Channel gone;
+                        if (_channels.TryGetValue(name, out gone))
+                        {
+                            gone.Starting = false;
+                            gone.State = AudioChannelState.Off;
+                        }
+                    }
+                    return;
+                }
+                Thread.Sleep(300);
+            }
         }
 
         string exe;
@@ -963,6 +1017,20 @@ public sealed class AudioController : IDisposable
     private static bool SafeExited(Process p)
     {
         try { return p.HasExited; } catch { return true; }
+    }
+
+    /// <summary>Открыт ли локальный порт (готовность локальной копии потока).</summary>
+    private static bool IsPortOpen(int port, int timeoutMs)
+    {
+        try
+        {
+            using (var client = new System.Net.Sockets.TcpClient())
+            {
+                var task = client.ConnectAsync("127.0.0.1", port);
+                return task.Wait(timeoutMs) && client.Connected;
+            }
+        }
+        catch { return false; }
     }
 
     // ---------------------------------------------------------------- громкость
