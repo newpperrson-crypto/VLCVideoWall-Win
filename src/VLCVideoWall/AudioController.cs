@@ -103,13 +103,20 @@ public sealed class AudioController : IDisposable
     public bool WallAudioMode { get { lock (_sync) return _wallAudio; } }
 
     /// <summary>
-    /// Подходит ли режим «звук из потока стены»: одна камера на всё полотно
-    /// (сетка 1×1) и включённая поддержка звука.
+    /// Сколько камер реально показывает полотно (столбцы × строки). Камеры дальше этого
+    /// числа в сетке не видны — их переключатели не должны управлять звуком стены.
+    /// </summary>
+    public int VisibleCount { get; set; } = int.MaxValue;
+
+    /// <summary>
+    /// Подходит ли режим «звук из потока стены»: полотно состоит из одной плитки
+    /// (сетка 1×1), поэтому стена показывает ровно одну камеру. Сколько камер при этом
+    /// в списке — неважно: на полотне всё равно первая, остальные ждут своей сетки.
     /// </summary>
     public static bool WallAudioFits(bool audioEnabled, string layout, int enabledCameras)
     {
         if (!audioEnabled) return false;
-        if (enabledCameras != 1) return false;
+        if (enabledCameras < 1) return false;
         return string.Equals((layout ?? "").Trim(), "1x1", StringComparison.OrdinalIgnoreCase);
     }
 
@@ -210,7 +217,8 @@ public sealed class AudioController : IDisposable
         {
             foreach (var ch in _channels.Values)
             {
-                var want = ch.On && pid > 0 && ch.Track != AudioTrackState.Absent
+                bool visible = ch.Order < VisibleCount;
+                var want = ch.On && visible && pid > 0 && ch.Track != AudioTrackState.Absent
                     ? AudioChannelState.Playing
                     : AudioChannelState.Off;
                 if (ch.State != want)
@@ -985,7 +993,11 @@ public sealed class AudioController : IDisposable
         if (pid <= 0) return;
 
         bool anyOn;
-        lock (_sync) anyOn = _channels.Values.Any(c => c.On);
+        lock (_sync)
+        {
+            // звуком стены управляет только та камера, которая на полотне видна
+            anyOn = _channels.Values.Any(c => c.Order < VisibleCount && c.On);
+        }
         float level = anyOn ? (float)(Math.Clamp(Volume, 0, 100) / 100.0) : 0f;
         uint id = (uint)pid;
         Task.Run(() => ProcessVolume.SetVolume(id, level));

@@ -726,6 +726,7 @@ public class MainForm : Form
             if (_numAudioVolume != null) _numAudioVolume.Value = Math.Clamp(_app.AudioVolume, 0, 100);
             _audio.Enabled = _app.AudioEnabled;
             _audio.Volume = Math.Clamp(_app.AudioVolume, 0, 100);
+            _audio.VisibleCount = Math.Max(1, _cfg.Cols) * Math.Max(1, _cfg.Rows);
             _audio.SetCameras(_cameras);
             _audio.RestoreStates(_app.AudioChannels);
             _chkLogAuto.Checked = _app.LogAutoRefresh;
@@ -1553,6 +1554,7 @@ public class MainForm : Form
         _cfg.PortAudio = (int)_numPortAudio.Value;
 
         _cfg.Layout = _cols.Value + "x" + _rows.Value;
+        _audio.VisibleCount = Math.Max(1, _cfg.Cols) * Math.Max(1, _cfg.Rows);
         _cfg.Windowed = _chkWindowed.Checked;
         _cfg.CanvasW = (int)_canvasW.Value;
         _cfg.CanvasH = (int)_canvasH.Value;

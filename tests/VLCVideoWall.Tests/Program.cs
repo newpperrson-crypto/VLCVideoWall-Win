@@ -228,8 +228,10 @@ internal static class Program
         Check(AudioController.WallAudioFits(true, "1x1", 1), "1×1 и одна камера — звук из потока стены");
         Check(!AudioController.WallAudioFits(false, "1x1", 1), "без поддержки звука режим не включается");
         Check(!AudioController.WallAudioFits(true, "2x2", 4), "сетка 2×2 — отдельные процессы звука");
-        Check(!AudioController.WallAudioFits(true, "1x1", 2), "две камеры — отдельные процессы звука");
+        Check(AudioController.WallAudioFits(true, "1x1", 2), "1×1: вторая камера в списке не мешает звуку");
+        Check(AudioController.WallAudioFits(true, "1x1", 16), "1×1: звук работает при любом числе камер в списке");
         Check(!AudioController.WallAudioFits(true, "1x1", 0), "без камер режим не включается");
+        Check(!AudioController.WallAudioFits(true, "2x1", 1), "сетка 2×1 — мозаика, звук отдельным процессом");
         Check(AudioController.WallAudioFits(true, " 1X1 ", 1), "регистр и пробелы в раскладке не мешают");
 
         using (var audio = new AudioController())
@@ -250,6 +252,24 @@ internal static class Program
             audio.SetWallAudio(false);
             Check(!audio.WallAudioMode, "режим стены выключается");
             Check(audio.IsOn("A"), "выключение режима не теряет выбор камеры");
+        }
+
+        // на полотне 1×1 видна только первая камера: вторая включена в списке, но звуком
+        // стены не управляет
+        using (var audio = new AudioController())
+        {
+            audio.SetCameras(new[] { Cam("A", "rtsp://192.0.2.1/a"), Cam("B", "rtsp://192.0.2.2/b") });
+            audio.Enabled = true;
+            audio.VisibleCount = 1;
+            audio.SetWallAudio(true);
+            audio.WallVlcPid = () => System.Diagnostics.Process.GetCurrentProcess().Id;
+
+            Check(audio.Toggle("A", false), "видимая камера переключается");
+            Check(audio.Toggle("B", false), "невидимая камера тоже запоминается");
+            audio.ActivateRuntime();
+
+            Check(audio.State("A") == AudioChannelState.Playing, "видимая камера — звук включён");
+            Check(audio.State("B") == AudioChannelState.Off, "невидимая камера звуком стены не управляет");
         }
     }
 
