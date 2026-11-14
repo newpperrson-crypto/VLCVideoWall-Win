@@ -109,28 +109,6 @@ public sealed class AudioController : IDisposable
     public int VisibleCount { get; set; } = int.MaxValue;
 
     /// <summary>
-    /// Звук читается из локальной копии потока (её держит сторож), а не с камеры:
-    /// камера с одним разрешённым подключением отдаёт видео и звук из одного сеанса.
-    /// </summary>
-    public bool RelayMode { get; set; }
-
-    /// <summary>Адрес, который читает звуковой процесс.</summary>
-    private string InputUrl(Channel ch)
-    {
-        if (RelayMode) return "http://127.0.0.1:" + RelayPortFor(_basePort, ch.Order);
-        return ch.Url;
-    }
-
-    /// <summary>
-    /// Порт локальной копии потока для камеры: сразу за диапазоном звука, по номеру окна.
-    /// Такой же расчёт делает сторож, когда поднимает локальные копии.
-    /// </summary>
-    public static int RelayPortFor(int basePort, int order)
-    {
-        return basePort + PortSpan + order;
-    }
-
-    /// <summary>
     /// Подходит ли режим «звук из потока стены»: полотно состоит из одной плитки
     /// (сетка 1×1), поэтому стена показывает ровно одну камеру. Сколько камер при этом
     /// в списке — неважно: на полотне всё равно первая, остальные ждут своей сетки.
@@ -637,10 +615,9 @@ public sealed class AudioController : IDisposable
     /// нет: камера с лимитом одного подключения принимает вторую сессию и молчит —
     /// тогда VLC останавливает воспроизведение, а значок показывал «включено».
     ///
-    /// Одиночная неудачная проверка не убивает канал: живой поток над локальной копией
-    /// бывает в состоянии «открывается» доли секунды, и раньше это выглядело как сбой —
-    /// процесс гасился и поднимался заново без причины. Гасим только после двух
-    /// подряд неудач с паузой, и «открывается/буферизуется» считаем рабочим.
+    /// Одна неудачная проверка канал не убивает: живой поток бывает доли секунды в
+    /// состоянии «открывается», и раньше это выглядело как сбой — процесс гасился и
+    /// поднимался заново без причины. Гасим только после двух неудач подряд.
     /// </summary>
     private async Task VerifyChannelAsync(string name, bool secondTry = false)
     {
@@ -668,11 +645,7 @@ public sealed class AudioController : IDisposable
                 {
                     var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
                     var m = System.Text.RegularExpressions.Regex.Match(body, "<state>([a-zA-Z]+)</state>");
-                    if (m.Success)
-                    {
-                        state = m.Groups[1].Value;
-                        answered = true;
-                    }
+                    if (m.Success) { state = m.Groups[1].Value; answered = true; }
                 }
             }
         }
@@ -699,7 +672,6 @@ public sealed class AudioController : IDisposable
 
         if (!secondTry)
         {
-            // вторая попытка через паузу: живой поток успевает выйти из «открывается»
             await Task.Delay(3500).ConfigureAwait(false);
             await VerifyChannelAsync(name, true).ConfigureAwait(false);
             return;
@@ -736,7 +708,6 @@ public sealed class AudioController : IDisposable
     {
         Channel ch;
         int port;
-        int waitForRelayPort = 0;
         string url, password;
 
         lock (_sync)
@@ -754,13 +725,6 @@ public sealed class AudioController : IDisposable
                 ch.State = AudioChannelState.Off;
                 return;
             }
-            // локальная копия может ещё не отдавать поток: подождём её (это фоновая
-            // задача, интерфейс не блокируется), иначе VLC откроет мёртвый адрес
-            if (RelayMode)
-            {
-                int relayPort = RelayPortFor(_basePort, ch.Order);
-                waitForRelayPort = relayPort;
-            }
             if (ch.Proc != null && !SafeExited(ch.Proc))
             {
                 ch.Starting = false;
@@ -770,32 +734,8 @@ public sealed class AudioController : IDisposable
             }
 
             port = ch.Port;
-            url = InputUrl(ch);
+            url = ch.Url;
             password = ch.Password;
-        }
-
-        // ждём готовности локальной копии уже без блокировки: канал ещё в состоянии
-        // «запускается», ничего не считается сбоем
-        if (waitForRelayPort > 0)
-        {
-            var waitRelay = Stopwatch.StartNew();
-            while (!IsPortOpen(waitForRelayPort, 250) && waitRelay.ElapsedMilliseconds < 8000)
-            {
-                if (_disposed || !_runtimeActive)
-                {
-                    lock (_sync)
-                    {
-                        Channel gone;
-                        if (_channels.TryGetValue(name, out gone))
-                        {
-                            gone.Starting = false;
-                            gone.State = AudioChannelState.Off;
-                        }
-                    }
-                    return;
-                }
-                Thread.Sleep(300);
-            }
         }
 
         string exe;
@@ -1041,20 +981,6 @@ public sealed class AudioController : IDisposable
     private static bool SafeExited(Process p)
     {
         try { return p.HasExited; } catch { return true; }
-    }
-
-    /// <summary>Открыт ли локальный порт (готовность локальной копии потока).</summary>
-    private static bool IsPortOpen(int port, int timeoutMs)
-    {
-        try
-        {
-            using (var client = new System.Net.Sockets.TcpClient())
-            {
-                var task = client.ConnectAsync("127.0.0.1", port);
-                return task.Wait(timeoutMs) && client.Connected;
-            }
-        }
-        catch { return false; }
     }
 
     // ---------------------------------------------------------------- громкость

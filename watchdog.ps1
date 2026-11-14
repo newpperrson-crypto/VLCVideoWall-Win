@@ -12,8 +12,7 @@
 param(
     [int]$WallPort = 0,    # локальный HTTP-порт VLC стены (0 = из Mosaic.conf или 4212)
     [int]$GuardPort = 0,   # локальный порт сторожа (0 = из Mosaic.conf или 42130)
-    [switch]$AudioFromWall, # звук берём из потока стены (одна камера), без отдельного VLC
-    [switch]$Relay          # локальная копия потока: камера читается один раз (для камер с одним подключением)
+    [switch]$AudioFromWall # звук берём из потока стены (одна камера), без отдельного VLC
 )
 
 $ErrorActionPreference = 'Continue'
@@ -52,10 +51,6 @@ if ($GuardPort -ge 1024 -and $GuardPort -le 65535) { $LOCK_PORT = $GuardPort }
 # Тогда VLM выводит поток напрямую (видео и звук в одном RTSP-сеансе) — иначе
 # камеры с лимитом одного подключения отдают звук второму процессу пустым.
 $script:AUDIO_FROM_WALL = [bool]$AudioFromWall
-# локальная копия потока: одну камеру читает один процесс, а стена и звук берут
-# видео и звук из этой копии — к камере уходит одно подключение вместо двух
-$script:RELAY = [bool]$Relay
-$script:PORT_AUDIO = 4213
 $PROBE_OK_INTERVAL   = 5    # опрос камеры, когда она не отвечает по сети
 $PROBE_SLOW_INTERVAL = 60   # порт открыт, но RTSP молчит
 $PROBE_AUTH_INTERVAL = 120  # 401/403: не чаще раза в 2 минуты, иначе камера банит IP
@@ -158,7 +153,6 @@ function Read-MosaicConf([string]$path) {
     $windowed = $false
     $portWall = 0
     $portGuard = 0
-    $portAudio = 4213
     $cams = @()
     foreach ($line in (Get-Content -LiteralPath $path -Encoding UTF8)) {
         $t = $line.Trim()
@@ -173,8 +167,6 @@ function Read-MosaicConf([string]$path) {
             $portWall = [int]$Matches[1]
         } elseif ($t -match '^port_guard\s*=\s*(\d+)') {
             $portGuard = [int]$Matches[1]
-        } elseif ($t -match '^port_audio\s*=\s*(\d+)') {
-            $portAudio = [int]$Matches[1]
         } elseif ($t -match '^windowed\s*=\s*(\S+)') {
             # стена в окне размером с полотно; по умолчанию выключено
             $windowed = @('yes', 'on', 'true', '1', 'да') -contains $Matches[1].ToLowerInvariant().Trim('"')
@@ -196,7 +188,7 @@ function Read-MosaicConf([string]$path) {
         Layout = $layout; Cams = @($cams)
         CanvasW = $canvasW; CanvasH = $canvasH; BgFile = $bgFile
         Windowed = $windowed
-        PortWall = $portWall; PortGuard = $portGuard; PortAudio = $portAudio
+        PortWall = $portWall; PortGuard = $portGuard
     }
 }
 
@@ -209,97 +201,6 @@ function Write-VlmText([string]$path, [string]$text) {
     if ($old -ne $text) {
         [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
     }
-}
-
-# ------------------------- локальная копия потока -------------------------
-# Камера, разрешающая только одно подключение, не отдаёт второй процесс: она принимает
-# сеанс и молчит. Поэтому камеру читает ОДИН процесс-коллектор, отдающий её локально,
-# а стена и звук берут видео и звук из этой одной копии. Подключение к камере остаётся одно.
-
-$script:RELAY_URL  = @{}   # имя канала -> http://127.0.0.1:порт
-$script:RELAY_PORT = @{}   # имя канала -> порт локальной копии
-$script:RELAY_PROC = @{}   # имя канала -> процесс коллектора
-$script:RELAY_FAILS = @{}  # имя канала -> подряд неудачных запусков
-
-function Get-ChannelInput($c) {
-    if ($script:RELAY -and $script:RELAY_URL.ContainsKey($c.Name)) { return $script:RELAY_URL[$c.Name] }
-    return $c.Url
-}
-
-function Start-RelayProc($c) {
-    $port = 0
-    if ($script:RELAY_PORT.ContainsKey($c.Name)) { $port = [int]$script:RELAY_PORT[$c.Name] }
-    if ($port -lt 1024) { return $null }
-
-    $launch = Get-LaunchDir
-    $argStr = '-I dummy --no-video-title-show --rtsp-tcp --sout "#std{access=http,mux=ts,dst=127.0.0.1:' + $port + '}" --sout-keep "' + $c.Url + '"'
-    try {
-        $p = Start-Process -FilePath $script:VLC_EXE -ArgumentList $argStr -WorkingDirectory $launch -PassThru
-        $script:RELAY_PROC[$c.Name] = $p
-        Write-Log ('{0}: локальная копия потока 127.0.0.1:{1} (pid {2})' -f $c.Name, $port, $p.Id)
-        return $p
-    } catch {
-        Write-Log ('{0}: локальная копия не запустилась: {1}' -f $c.Name, $_.Exception.Message)
-        $script:RELAY_PROC[$c.Name] = $null
-        return $null
-    }
-}
-
-function Stop-RelayProc([string]$name) {
-    $p = $script:RELAY_PROC[$name]
-    $script:RELAY_PROC[$name] = $null
-    if (-not $p) { return }
-    try {
-        if (-not $p.HasExited) {
-            $p.Kill()
-            [void]$p.WaitForExit(4000)
-        }
-    } catch { }
-}
-
-function Stop-AllRelays {
-    foreach ($n in @($script:RELAY_PROC.Keys)) { Stop-RelayProc $n }
-}
-
-function Initialize-RelayUrls($channels) {
-    # порты локальных копий идут сразу за диапазоном звука: port_audio+16 … +31
-    $i = 0
-    foreach ($c in $channels) {
-        if ($script:RELAY_PORT.ContainsKey($c.Name)) { $i++; continue }
-        $script:RELAY_PORT[$c.Name] = $script:PORT_AUDIO + 16 + $i
-        $script:RELAY_URL[$c.Name] = 'http://127.0.0.1:' + ($script:PORT_AUDIO + 16 + $i)
-        $i++
-    }
-}
-
-function Start-AllRelays($channels) {
-    Initialize-RelayUrls $channels
-    foreach ($c in $channels) {
-        [void](Start-RelayProc $c)
-        [void](Start-SleepChecked 1)
-    }
-    # ждём, пока копии начнут отдавать: если стена стартует раньше, VLC не откроет
-    # локальный адрес и канал останется мёртвым
-    $deadline = (Get-Date).AddSeconds(15)
-    while ((Get-Date) -lt $deadline) {
-        $ready = $true
-        foreach ($c in $channels) {
-            $port = 0
-            if ($script:RELAY_PORT.ContainsKey($c.Name)) { $port = [int]$script:RELAY_PORT[$c.Name] }
-            if ($port -lt 1024) { continue }
-            $ok = $false
-            try {
-                $cl = New-Object System.Net.Sockets.TcpClient
-                $iar = $cl.BeginConnect('127.0.0.1', $port, $null, $null)
-                if ($iar.AsyncWaitHandle.WaitOne(400) -and $cl.Connected) { $ok = $true }
-                $cl.Close()
-            } catch { }
-            if (-not $ok) { $ready = $false; break }
-        }
-        if ($ready) { break }
-        if (-not (Start-SleepChecked 1)) { return }
-    }
-    Write-Log ('локальные копии потока: {0} шт. (камера читается один раз)' -f $channels.Count)
 }
 
 function Write-MosaicVlm([string]$path, $conf) {
@@ -327,9 +228,8 @@ function Write-MosaicVlm([string]$path, $conf) {
         [void]$d.AppendLine('# собрано автоматически из Mosaic.conf: одна камера, звук из того же потока')
         [void]$d.AppendLine('')
         [void]$d.AppendLine(('new {0} broadcast enabled' -f $use[0].Name))
-        $din = Get-ChannelInput $use[0]
-        [void]$d.AppendLine(('setup {0} input "{1}"' -f $use[0].Name, $din))
-        if ($din -match '^rtsp://') { [void]$d.AppendLine(('setup {0} option rtsp-tcp' -f $use[0].Name)) }
+        [void]$d.AppendLine(('setup {0} input "{1}"' -f $use[0].Name, $use[0].Url))
+        [void]$d.AppendLine(('setup {0} option rtsp-tcp' -f $use[0].Name))
         [void]$d.AppendLine(('setup {0} option network-caching=1500' -f $use[0].Name))
         [void]$d.AppendLine(('setup {0} option sout-keep' -f $use[0].Name))
         [void]$d.AppendLine(('setup {0} output #display' -f $use[0].Name))
@@ -347,9 +247,8 @@ function Write-MosaicVlm([string]$path, $conf) {
     foreach ($c in $use) {
         [void]$sb.AppendLine('')
         [void]$sb.AppendLine(('new {0} broadcast enabled' -f $c.Name))
-        $inp = Get-ChannelInput $c
-        [void]$sb.AppendLine(('setup {0} input "{1}"' -f $c.Name, $inp))
-        if ($inp -match '^rtsp://') { [void]$sb.AppendLine(('setup {0} option rtsp-tcp' -f $c.Name)) }
+        [void]$sb.AppendLine(('setup {0} input "{1}"' -f $c.Name, $c.Url))
+        [void]$sb.AppendLine(('setup {0} option rtsp-tcp' -f $c.Name))
         [void]$sb.AppendLine(('setup {0} option network-caching=1500' -f $c.Name))
         [void]$sb.AppendLine(('setup {0} option sout-keep' -f $c.Name))
         [void]$sb.AppendLine(('setup {0} option no-audio' -f $c.Name))
@@ -870,10 +769,6 @@ function Complete-Stop($proc, [string]$why) {
     # если VLC не завершился, это не скрываем: vlc.pid остаётся, приложение
     # увидит живой процесс и сообщит, что стена не остановлена.
     Write-Log $why
-    if ($script:RELAY) {
-        Stop-AllRelays
-        Write-Log 'локальные копии потоков остановлены'
-    }
     $stopped = Stop-MosaicVlc $proc
     if (-not $stopped) {
         Write-Log 'ВНИМАНИЕ: VLC не удалось завершить — стена считается неостановленной, vlc.pid сохранён'
@@ -891,22 +786,6 @@ function Get-NowSeconds {
 # ------------------------- основной цикл -------------------------
 
 function Invoke-Watchdog {
-    # режим локальной копии требует знать камеры ДО генерации VLM: в VLM пишутся
-    # локальные адреса, а не адреса камер
-    if ($script:RELAY -and -not $env:MOSAIC_VLM) {
-        $confPath0 = Join-Path $BASE 'Mosaic.conf'
-        if (Test-Path -LiteralPath $confPath0) {
-            $pre = Read-MosaicConf $confPath0
-            if ($pre.PortAudio -ge 1024 -and $pre.PortAudio -le 65519) { $script:PORT_AUDIO = [int]$pre.PortAudio }
-            $pp = $pre.Layout -split 'x'
-            $max0 = [math]::Min([int]$pp[0] * [int]$pp[1], 16)
-            Initialize-RelayUrls @($pre.Cams | Select-Object -First $max0)
-        }
-    } elseif ($script:RELAY -and $env:MOSAIC_VLM) {
-        Write-Log 'локальная копия потока не применяется: задан свой Mosaic.vlm (env MOSAIC_VLM)'
-        $script:RELAY = $false
-    }
-
     $scene = Initialize-Scene
     $script:VLM_FILE = $scene.Path
     $channels = @($scene.Channels)
@@ -941,14 +820,6 @@ function Invoke-Watchdog {
         $script:HTTP_PORT = $scene.PortWall
         Write-Log ('порт стены из Mosaic.conf: {0}' -f $script:HTTP_PORT)
     }
-    if ($scene.PortAudio -ge 1024 -and $scene.PortAudio -le 65519) {
-        $script:PORT_AUDIO = [int]$scene.PortAudio
-    }
-
-    # локальные копии потоков: поднимаем ДО стены, иначе VLM не откроет локальные адреса
-    if ($script:RELAY) {
-        Start-AllRelays $channels
-    }
 
     $proc = $null
     $graceUntil = 0.0
@@ -968,25 +839,6 @@ function Invoke-Watchdog {
         Write-Heartbeat
         if (Test-Path -LiteralPath $STOP_FLAG) {
             return (Complete-Stop $proc 'найден stop.flag - останавливаюсь')
-        }
-
-        # локальные копии потоков: камера читается один раз, поэтому обрыв копии
-        # останавливает и картинку, и звук — перезапускаем её сами
-        if ($script:RELAY) {
-            foreach ($c in $channels) {
-                $rp = $script:RELAY_PROC[$c.Name]
-                if ($rp -and -not $rp.HasExited) {
-                    $script:RELAY_FAILS[$c.Name] = 0
-                    continue
-                }
-                $f = 1
-                if ($script:RELAY_FAILS.ContainsKey($c.Name)) { $f = [int]$script:RELAY_FAILS[$c.Name] + 1 }
-                $script:RELAY_FAILS[$c.Name] = $f
-                if ($f -gt 5) { continue }
-                Write-Log ('{0}: локальная копия остановилась — перезапускаю (попытка {1} из 5)' -f $c.Name, $f)
-                [void](Start-RelayProc $c)
-                [void](Start-SleepChecked 1)
-            }
         }
 
 

@@ -55,7 +55,7 @@ public class WallConfig
 
         foreach (var raw in File.ReadAllLines(path, Encoding.UTF8))
         {
-            var t = raw.Trim().TrimStart('\uFEFF');
+            var t = raw.Trim().TrimStart((char)0xFEFF);
             if (t.Length == 0 || t.StartsWith("#")) continue;
 
             var eq = t.IndexOf('=');
@@ -245,13 +245,6 @@ public class AppSettings
     /// <summary>Камеры, у которых звук включён. По умолчанию ни у одной.</summary>
     public System.Collections.Generic.List<string> AudioChannels { get; set; }
         = new System.Collections.Generic.List<string>();
-
-    /// <summary>
-    /// Звук через локальную копию потока: камеру читает один процесс, стена и звук
-    /// берут видео и звук из этой копии. Нужно камерам, которые разрешают только одно
-    /// подключение. По умолчанию выключено (лишняя пересылка не всем нужна).
-    /// </summary>
-    public bool RelayAudio { get; set; }
 
     private static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
 

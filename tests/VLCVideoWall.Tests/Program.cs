@@ -56,13 +56,12 @@ internal static class Program
         // файл с BOM (так пишет PowerShell) не должен превращаться в настройки по умолчанию:
         // иначе выключенный звук выглядит как «звук пропал»
         var bomPath = Path.Combine(Path.GetTempPath(), "vw-bom-" + Guid.NewGuid().ToString("N") + ".json");
-        var json = "{\"AudioEnabled\":true,\"AudioVolume\":55,\"AudioChannels\":[\"ch2\"],\"RelayAudio\":true}";
+        var json = "{\"AudioEnabled\":true,\"AudioVolume\":55,\"AudioChannels\":[\"ch2\"]}";
         File.WriteAllText(bomPath, json, new UTF8Encoding(true));
         var fromBom = AppSettings.Load(bomPath);
         Check(fromBom.AudioEnabled, "настройки с BOM читаются: поддержка звука включена");
         Check(fromBom.AudioVolume == 55, "настройки с BOM читаются: громкость");
         Check(fromBom.AudioChannels.Contains("ch2"), "настройки с BOM читаются: включённые камеры");
-        Check(fromBom.RelayAudio, "настройки с BOM читаются: локальная копия");
         try { File.Delete(bomPath); } catch { }
 
         Console.WriteLine("порты звука:");
@@ -283,12 +282,6 @@ internal static class Program
             Check(audio.State("A") == AudioChannelState.Playing, "видимая камера — звук включён");
             Check(audio.State("B") == AudioChannelState.Off, "невидимая камера звуком стены не управляет");
         }
-
-        // порты локальной копии: сразу за диапазоном звука, по номеру окна
-        Check(AudioController.RelayPortFor(4213, 0) == 4229, "локальная копия первой камеры — 4229");
-        Check(AudioController.RelayPortFor(4213, 15) == 4244, "локальная копия 16-й камеры — 4244");
-        Check(AudioController.RelayPortFor(4313, 0) == 4329, "смена базового порта сдвигает и копии");
-        Check(AudioController.RelayPortFor(4213, 0) > 4213 + 15, "порты копий не пересекаются со звуком");
     }
 
     private static void AudioPorts()

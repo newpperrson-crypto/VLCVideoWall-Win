@@ -172,7 +172,7 @@ public class WallController
     /// того же RTSP-потока, что и видео (сетка 1×1, одна камера): камеры с лимитом
     /// одного подключения не отдают вторую сессию, и отдельный процесс звука молчит.
     /// </summary>
-    public async Task StartAsync(bool audioFromWall = false, bool relay = false)
+    public async Task StartAsync(bool audioFromWall = false)
     {
         if (IsGuardBusy())
             throw new InvalidOperationException(
@@ -202,8 +202,7 @@ public class WallController
         var psi = new ProcessStartInfo("powershell.exe",
             "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + Watchdog + "\"" +
             " -WallPort " + VlcHttpPort + " -GuardPort " + GuardPort +
-            (audioFromWall ? " -AudioFromWall" : "") +
-            (relay ? " -Relay" : ""));
+            (audioFromWall ? " -AudioFromWall" : ""));
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
         psi.WorkingDirectory = BaseDir;
