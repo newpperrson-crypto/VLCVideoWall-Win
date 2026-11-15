@@ -11,8 +11,7 @@ public enum AudioBadgeState
 {
     Off,        // звук камеры выключен
     On,         // звук включён
-    Busy,       // команда принята, идёт переключение
-    NoTrack     // в потоке камеры нет звуковой дорожки
+    NoTrack     // звука у камеры нет — переключать нечего
 }
 
 /// <summary>
@@ -172,7 +171,7 @@ public sealed class AudioBadgeWindow : IDisposable
             case WM_LBUTTONUP:
             case WM_RBUTTONUP:
                 ReleaseCapture();
-                if (self.State == AudioBadgeState.NoTrack || self.State == AudioBadgeState.Busy) return IntPtr.Zero;
+                if (self.State == AudioBadgeState.NoTrack) return IntPtr.Zero;
 
                 // защита от двойного срабатывания при быстрой перерисовке
                 long now = Environment.TickCount64;
@@ -254,9 +253,7 @@ public sealed class AudioBadgeWindow : IDisposable
 
         var body = new Rectangle(1, 1, Width - 3, Height - 3);
         using (var path = Round(body, 9))
-        using (var fill = new SolidBrush(State == AudioBadgeState.Busy
-                                            ? Color.FromArgb(64, 72, 84)
-                                            : Color.FromArgb(40, 46, 56)))
+        using (var fill = new SolidBrush(Color.FromArgb(40, 46, 56)))
         using (var pen = new Pen(Color.FromArgb(96, 106, 122), 1.2f))
         {
             g.FillPath(fill, path);
@@ -267,7 +264,6 @@ public sealed class AudioBadgeWindow : IDisposable
         switch (State)
         {
             case AudioBadgeState.On: fg = Color.FromArgb(134, 239, 172); break;
-            case AudioBadgeState.Busy: fg = Color.FromArgb(226, 232, 240); break;
             case AudioBadgeState.NoTrack: fg = Color.FromArgb(118, 126, 138); break;
             default: fg = Color.FromArgb(150, 164, 184); break;
         }
@@ -299,12 +295,6 @@ public sealed class AudioBadgeWindow : IDisposable
                 // дорожки нет: динамик перечёркнут крестом
                 g.DrawLine(pen, (int)(size * 0.52), (int)(size * 0.30), (int)(size * 0.80), (int)(size * 0.70));
                 g.DrawLine(pen, (int)(size * 0.80), (int)(size * 0.30), (int)(size * 0.52), (int)(size * 0.70));
-            }
-            else if (State == AudioBadgeState.Busy)
-            {
-                for (int i = 0; i < 3; i++)
-                    g.FillEllipse(Brushes.White, (int)(size * 0.54) + i * (int)(size * 0.11),
-                                  (int)(size * 0.46), (int)(size * 0.06), (int)(size * 0.06));
             }
             // выключен: только динамик, без перечёркивания
         }

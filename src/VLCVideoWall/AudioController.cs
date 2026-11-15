@@ -76,6 +76,15 @@ public sealed class AudioController : IDisposable
     private readonly Dictionary<string, Channel> _channels = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _sync = new();
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(2) };
+
+    /// <summary>У камеры в потоке нет звуковой дорожки (проверено по факту воспроизведения).</summary>
+    public event Action<string> NoTrack;
+
+    /// <summary>Камеры, про которые уже известно, что звука в потоке нет.</summary>
+    private readonly HashSet<string> _noTrack = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Порты локальных копий из файла сторожа (имя камеры -> порт).</summary>
+    private readonly Dictionary<string, int> _relayPorts = new(StringComparer.OrdinalIgnoreCase);
     private readonly CancellationTokenSource _volumeCts = new();
     private readonly Task _volumeLoop;
     private int _basePort = 4213;
@@ -107,6 +116,54 @@ public sealed class AudioController : IDisposable
     /// числа в сетке не видны — их переключатели не должны управлять звуком стены.
     /// </summary>
     public int VisibleCount { get; set; } = int.MaxValue;
+
+    /// <summary>
+    /// Звук читается из локальной копии потока (её держит сторож), а не с камеры:
+    /// камера с одним разрешённым подключением отдаёт видео и звук из одного сеанса.
+    /// </summary>
+    public bool RelayMode { get; set; }
+
+    /// <summary>Адрес, который читает звуковой процесс.</summary>
+    /// <summary>
+    /// Порт локальной копии камеры. Берём из карты сторожа (файл relay.ports): камера,
+    /// переставленная в другую ячейку, сохраняет свой порт. Расчёт по номеру окна —
+    /// только запасной вариант, если карты ещё нет.
+    /// </summary>
+    private int RelayPortOf(Channel ch)
+    {
+        lock (_sync)
+        {
+            int port;
+            if (_relayPorts.TryGetValue(ch.Name, out port) && port >= 1024) return port;
+        }
+        return RelayPortFor(_basePort, ch.Order);
+    }
+
+    /// <summary>Карта портов копий от сторожа: имя камеры -> порт.</summary>
+    public void SetRelayPorts(IDictionary<string, int> map)
+    {
+        if (map == null) return;
+        lock (_sync)
+        {
+            _relayPorts.Clear();
+            foreach (var kv in map) if (kv.Value >= 1024) _relayPorts[kv.Key] = kv.Value;
+        }
+    }
+
+    private string InputUrl(Channel ch)
+    {
+        if (RelayMode) return "http://127.0.0.1:" + RelayPortOf(ch);
+        return ch.Url;
+    }
+
+    /// <summary>
+    /// Порт локальной копии потока для камеры: сразу за диапазоном звука, по номеру окна.
+    /// Такой же расчёт делает сторож, когда поднимает локальные копии.
+    /// </summary>
+    public static int RelayPortFor(int basePort, int order)
+    {
+        return basePort + PortSpan + order;
+    }
 
     /// <summary>
     /// Подходит ли режим «звук из потока стены»: полотно состоит из одной плитки
@@ -397,6 +454,44 @@ public sealed class AudioController : IDisposable
         }
     }
 
+    /// <summary>Подставить список камер, у которых звука в потоке нет (из настроек).</summary>
+    public void SetKnownNoTrack(IEnumerable<string> names)
+    {
+        lock (_sync)
+        {
+            _noTrack.Clear();
+            if (names != null) foreach (var n in names) if (!string.IsNullOrWhiteSpace(n)) _noTrack.Add(n);
+            foreach (var ch in _channels.Values)
+                if (_noTrack.Contains(ch.Name))
+                {
+                    // включать нечего: снимаем галочку, чтобы настройки не обещали звук
+                    ch.Track = AudioTrackState.Absent;
+                    ch.On = false;
+                }
+        }
+    }
+
+    /// <summary>
+    /// Забыть результаты проверки «звука нет»: при следующем запуске каналов
+    /// дорожки проверятся заново (например, к камере подключили микрофон).
+    /// </summary>
+    public void ClearNoTrack()
+    {
+        lock (_sync)
+        {
+            _noTrack.Clear();
+            foreach (var ch in _channels.Values)
+                if (ch.Track == AudioTrackState.Absent) ch.Track = AudioTrackState.Unknown;
+        }
+        RaiseChanged();
+    }
+
+    /// <summary>Камеры, у которых звуковой дорожки нет (для сохранения в настройках).</summary>
+    public List<string> NoTrackChannels()
+    {
+        lock (_sync) return _noTrack.ToList();
+    }
+
     public AudioTrackState TrackState(string name)
     {
         lock (_sync) { Channel ch; return _channels.TryGetValue(name, out ch) ? ch.Track : AudioTrackState.Unknown; }
@@ -438,6 +533,96 @@ public sealed class AudioController : IDisposable
         }
     }
 
+    /// <summary>
+    /// Проверить дорожки по локальным копиям (в режиме копий). Это проверка при каждом
+    /// запуске стены: разбирается PMT того потока, который уже играет стена, поэтому
+    /// не нужны ни авторизация камеры, ни её SDP. Камеры без звука гасятся сразу.
+    /// </summary>
+    public async Task ProbeStreamsAsync(int timeoutMs = 8000)
+    {
+        if (!RelayMode) { ProbeTracks(); return; }
+
+        List<Tuple<string, int>> items;
+        lock (_sync)
+        {
+            items = _channels.Values
+                .Select(c => Tuple.Create(c.Name, RelayPortOf(c)))
+                .ToList();
+        }
+        if (items.Count == 0) return;
+
+        var unknown = new List<string>();
+
+        // параллельно: у каждой камеры свой порт, ожидание в сумме не растёт
+        var checks = items.Select(it => Task.Run(() =>
+        {
+            var state = StreamProbe.HasAudioTrack(it.Item2, timeoutMs);
+            return Tuple.Create(it.Item1, state);
+        })).ToArray();
+
+        foreach (var check in checks)
+        {
+            var result = await check.ConfigureAwait(false);
+            var name = result.Item1;
+            if (result.Item2 == AudioTrackState.Unknown)
+            {
+                // HEVC-камера отдаёт таблицы реже, а на старте поток только поднимается:
+                // повторяем проверку, иначе камера без звука осталась бы «включённой»
+                unknown.Add(name);
+                continue;
+            }
+
+            if (result.Item2 == AudioTrackState.Absent)
+            {
+                MarkNoTrack(name);
+                continue;
+            }
+
+            bool changed;
+            lock (_sync)
+            {
+                Channel ch;
+                changed = _channels.TryGetValue(name, out ch) && ch.Track != AudioTrackState.Present;
+                if (changed) { ch.Track = AudioTrackState.Present; _noTrack.Remove(name); }
+            }
+            if (changed) RaiseChanged();
+        }
+
+        for (int attempt = 0; attempt < 2 && unknown.Count > 0; attempt++)
+        {
+            await Task.Delay(4000).ConfigureAwait(false);
+            var retry = new List<string>();
+            foreach (var name in unknown)
+            {
+                int port = 0;
+                lock (_sync)
+                {
+                    Channel ch;
+                    if (_channels.TryGetValue(name, out ch)) port = RelayPortOf(ch);
+                }
+                if (port < 1024) continue;
+                var state = await Task.Run(() => StreamProbe.HasAudioTrack(port, timeoutMs)).ConfigureAwait(false);
+                if (state == AudioTrackState.Unknown) { retry.Add(name); continue; }
+                if (state == AudioTrackState.Absent) { MarkNoTrack(name); continue; }
+                bool changed;
+                lock (_sync)
+                {
+                    Channel ch;
+                    changed = _channels.TryGetValue(name, out ch) && ch.Track != AudioTrackState.Present;
+                    if (changed) { ch.Track = AudioTrackState.Present; _noTrack.Remove(name); }
+                }
+                if (changed) RaiseChanged();
+            }
+            unknown = retry;
+        }
+    }
+
+    /// <summary>То же в фоне (кнопка «Проверить звук у камер»).</summary>
+    public void ProbeStreams()
+    {
+        _ = Task.Run(async () => { try { await ProbeStreamsAsync().ConfigureAwait(false); } catch { } });
+    }
+
     /// <summary>Проверить наличие звуковой дорожки у всех камер (в фоне).</summary>
     public void ProbeTracks()
     {
@@ -451,12 +636,31 @@ public sealed class AudioController : IDisposable
             Task.Run(() =>
             {
                 var state = RtspProbe.HasAudioTrack(url, 3000);
+
+                // «проверить не удалось» не должно превращаться в «звук есть»
+                if (state == AudioTrackState.Unknown) state = AudioTrackState.Unknown;
+                bool changed = false;
                 lock (_sync)
                 {
                     Channel target;
-                    if (_channels.TryGetValue(name, out target)) target.Track = state;
+                    if (_channels.TryGetValue(name, out target))
+                    {
+                        if (state == AudioTrackState.Present)
+                        {
+                            _noTrack.Remove(name);
+                            target.Track = AudioTrackState.Present;
+                            changed = true;
+                        }
+                        else if (state == AudioTrackState.Absent)
+                        {
+                            _noTrack.Add(name);
+                            target.Track = AudioTrackState.Absent;
+                            changed = true;
+                        }
+                        // Unknown: оставляем то, что уже известно — «нет звука» не отменяется
+                    }
                 }
-                RaiseChanged();
+                if (changed) RaiseChanged();
             });
         }
     }
@@ -475,7 +679,9 @@ public sealed class AudioController : IDisposable
         {
             Channel ch;
             if (!_channels.TryGetValue(name, out ch)) return false;
-            if (startProcess && ch.Track == AudioTrackState.Absent) return false;
+            // «звука нет» блокирует включение только у работающей стены: на остановленной
+            // состояние дорожки проверить нечем, и настройку надо дать поменять
+            if (startProcess && _runtimeActive && Enabled && ch.Track == AudioTrackState.Absent) return false;
             if (ch.Starting || ch.State == AudioChannelState.Starting || ch.State == AudioChannelState.Recovering)
                 return false;
 
@@ -491,8 +697,11 @@ public sealed class AudioController : IDisposable
             }
             else
             {
-                ch.State = wantOn ? AudioChannelState.Starting : AudioChannelState.Off;
+                // без запуска процесса (стена стоит) состояние остаётся «выключено»:
+                // иначе следующий клик упрётся в «идёт запуск» и камеру нельзя будет выключить
+                ch.State = wantOn && startProcess ? AudioChannelState.Starting : AudioChannelState.Off;
                 if (startProcess && wantOn && _runtimeActive && Enabled) ch.Starting = true;
+                if (wantOn) _noTrack.Remove(name);   // пользователь включил — пометка не актуальна
             }
         }
 
@@ -611,13 +820,76 @@ public sealed class AudioController : IDisposable
     }
 
     /// <summary>
+    /// Есть ли в потоке, который играет наш процесс, звуковая дорожка.
+    /// status.xml перечисляет дорожки как «Stream N» с описанием кодека; сами описания
+    /// VLC пишет по-английски («A52 Audio (aka AC3)», «MPEG-4 Video (mp4v)»), даже когда
+    /// подписи полей локализованы. null — дорожки ещё не описаны, выводить нечего.
+    /// </summary>
+    internal static bool? StreamHasAudio(string statusXml)
+    {
+        if (string.IsNullOrEmpty(statusXml)) return null;
+        // Имена полей VLC переводит на язык интерфейса (и кодирует их в XML по-разному),
+        // а вот описания кодеков всегда английские: «A52 Audio (aka AC3)», «MPEG-4 Video».
+        // Поэтому смотрим только значения.
+        var infos = System.Text.RegularExpressions.Regex.Matches(statusXml, "<info name=['\"][^'\"]*['\"]>([^<]*)</info>");
+        if (infos.Count == 0) return null;
+        bool video = false;
+        foreach (System.Text.RegularExpressions.Match c in infos)
+        {
+            var v = c.Groups[1].Value;
+            if (v.IndexOf("audio", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            if (v.IndexOf("аудио", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            // «Тип» VLC пишет по-русски, а HEVC-камера в описании кодека не содержит слова
+            // «Video»: «MPEG-H Part2/HEVC (H.265) (hevc)». Без этих признаков камера без
+            // звука оставалась «включённой» — решили, что дорожки просто не разобраны
+            if (v.IndexOf("video", StringComparison.OrdinalIgnoreCase) >= 0) video = true;
+            if (v.IndexOf("видео", StringComparison.OrdinalIgnoreCase) >= 0) video = true;
+            if (v.IndexOf("hevc", StringComparison.OrdinalIgnoreCase) >= 0) video = true;
+            if (v.IndexOf("H.26", StringComparison.OrdinalIgnoreCase) >= 0) video = true;
+        }
+        // описания дорожек уже загружены, а звука среди них нет
+        return video ? false : null;
+    }
+
+    /// <summary>
+    /// У камеры нет звука в потоке: гасим процесс, снимаем галочку и запоминаем,
+    /// что переключать нечего. Значок и подпись показывают «нет звука у камеры».
+    /// </summary>
+    private void MarkNoTrack(string name)
+    {
+        bool changed = false;
+        lock (_sync)
+        {
+            Channel ch;
+            if (!_channels.TryGetValue(name, out ch)) return;
+            if (ch.Track == AudioTrackState.Absent && !ch.On) return;
+            ch.Track = AudioTrackState.Absent;
+            _noTrack.Add(name);
+            ch.On = false;
+            ch.Starting = false;
+            ch.Verified = false;
+            ch.VerifyPending = false;
+            ch.Fails = 0;
+            ch.State = AudioChannelState.Off;
+            KillChannelBlocking(ch);
+            changed = true;
+        }
+        if (changed)
+        {
+            RaiseChanged();
+            RaiseNoTrack(name);
+        }
+    }
+
+    /// <summary>
     /// Проверка, что звук канала действительно идёт. Процесс VLC может быть жив, а потока
     /// нет: камера с лимитом одного подключения принимает вторую сессию и молчит —
     /// тогда VLC останавливает воспроизведение, а значок показывал «включено».
     ///
-    /// Одна неудачная проверка канал не убивает: живой поток бывает доли секунды в
-    /// состоянии «открывается», и раньше это выглядело как сбой — процесс гасился и
-    /// поднимался заново без причины. Гасим только после двух неудач подряд.
+    /// Одиночная неудачная проверка не убивает канал: живой поток над локальной копией
+    /// бывает в состоянии «открывается» доли секунды, и раньше это выглядело как сбой —
+    /// процесс гасился и поднимался заново без причины. Гасим только после двух
+    /// подряд неудач с паузой, и «открывается/буферизуется» считаем рабочим.
     /// </summary>
     private async Task VerifyChannelAsync(string name, bool secondTry = false)
     {
@@ -633,6 +905,7 @@ public sealed class AudioController : IDisposable
         }
 
         string state = "";
+        string body = "";
         bool answered = false;
         try
         {
@@ -643,9 +916,13 @@ public sealed class AudioController : IDisposable
                 req.Headers.Authorization = new AuthenticationHeaderValue("Basic", auth);
                 using (var resp = await _http.SendAsync(req).ConfigureAwait(false))
                 {
-                    var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
                     var m = System.Text.RegularExpressions.Regex.Match(body, "<state>([a-zA-Z]+)</state>");
-                    if (m.Success) { state = m.Groups[1].Value; answered = true; }
+                    if (m.Success)
+                    {
+                        state = m.Groups[1].Value;
+                        answered = true;
+                    }
                 }
             }
         }
@@ -658,6 +935,14 @@ public sealed class AudioController : IDisposable
 
         if (ok)
         {
+            // процесс играет, но звука в потоке может не быть вовсе: камера без микрофона
+            // или без звуковой дорожки. Тогда честно говорим «нет звука», а не «включено».
+            if (StreamHasAudio(body) == false)
+            {
+                MarkNoTrack(name);
+                return;
+            }
+
             lock (_sync)
             {
                 Channel ch;
@@ -665,6 +950,8 @@ public sealed class AudioController : IDisposable
                 {
                     ch.VerifyPending = false;
                     ch.Verified = true;
+                    ch.Track = AudioTrackState.Present;
+                    _noTrack.Remove(name);
                 }
             }
             return;
@@ -672,6 +959,7 @@ public sealed class AudioController : IDisposable
 
         if (!secondTry)
         {
+            // вторая попытка через паузу: живой поток успевает выйти из «открывается»
             await Task.Delay(3500).ConfigureAwait(false);
             await VerifyChannelAsync(name, true).ConfigureAwait(false);
             return;
@@ -708,6 +996,7 @@ public sealed class AudioController : IDisposable
     {
         Channel ch;
         int port;
+        int waitForRelayPort = 0;
         string url, password;
 
         lock (_sync)
@@ -725,6 +1014,13 @@ public sealed class AudioController : IDisposable
                 ch.State = AudioChannelState.Off;
                 return;
             }
+            // локальная копия может ещё не отдавать поток: подождём её (это фоновая
+            // задача, интерфейс не блокируется), иначе VLC откроет мёртвый адрес
+            if (RelayMode)
+            {
+                int relayPort = RelayPortOf(ch);
+                waitForRelayPort = relayPort;
+            }
             if (ch.Proc != null && !SafeExited(ch.Proc))
             {
                 ch.Starting = false;
@@ -734,8 +1030,32 @@ public sealed class AudioController : IDisposable
             }
 
             port = ch.Port;
-            url = ch.Url;
+            url = InputUrl(ch);
             password = ch.Password;
+        }
+
+        // ждём готовности локальной копии уже без блокировки: канал ещё в состоянии
+        // «запускается», ничего не считается сбоем
+        if (waitForRelayPort > 0)
+        {
+            var waitRelay = Stopwatch.StartNew();
+            while (!IsPortOpen(waitForRelayPort, 250) && waitRelay.ElapsedMilliseconds < 8000)
+            {
+                if (_disposed || !_runtimeActive)
+                {
+                    lock (_sync)
+                    {
+                        Channel gone;
+                        if (_channels.TryGetValue(name, out gone))
+                        {
+                            gone.Starting = false;
+                            gone.State = AudioChannelState.Off;
+                        }
+                    }
+                    return;
+                }
+                Thread.Sleep(300);
+            }
         }
 
         string exe;
@@ -745,13 +1065,25 @@ public sealed class AudioController : IDisposable
             return;
         }
 
-        // адрес камеры (с логином и паролем) кладём в файл плейлиста:
-        // в командной строке процесса секретов не остаётся
-        var playlist = AudioPlaylist.Write(name, url);
-        if (playlist == null)
+        // Адрес камеры (с логином и паролем) кладём в файл плейлиста: в командной строке
+        // процесса секретов не остаётся. Локальная копия секретов не содержит и передаётся
+        // напрямую: при воспроизведении плейлиста VLC не отдаёт сведения о дорожках
+        // (status.xml без <information>), а по ним мы проверяем, есть ли в потоке звук.
+        string target;
+        if (url.StartsWith("http://127.0.0.1:", StringComparison.OrdinalIgnoreCase))
         {
-            FailStart(name, "не удалось подготовить файл потока");
-            return;
+            AudioPlaylist.Delete(name);
+            target = url;
+        }
+        else
+        {
+            var playlist = AudioPlaylist.Write(name, url);
+            if (playlist == null)
+            {
+                FailStart(name, "не удалось подготовить файл потока");
+                return;
+            }
+            target = playlist;
         }
 
         var args = new StringBuilder();
@@ -759,7 +1091,7 @@ public sealed class AudioController : IDisposable
         args.Append("--volume ").Append(VolumeToVlc(Volume)).Append(' ');
         args.Append("--extraintf http --http-host 127.0.0.1 --http-port ").Append(port).Append(' ');
         args.Append("--http-password ").Append(password).Append(' ');
-        args.Append('"').Append(playlist).Append('"');
+        args.Append('"').Append(target).Append('"');
 
         // перед запуском повторно проверяем, что остановка не началась
         lock (_sync)
@@ -983,6 +1315,20 @@ public sealed class AudioController : IDisposable
         try { return p.HasExited; } catch { return true; }
     }
 
+    /// <summary>Открыт ли локальный порт (готовность локальной копии потока).</summary>
+    private static bool IsPortOpen(int port, int timeoutMs)
+    {
+        try
+        {
+            using (var client = new System.Net.Sockets.TcpClient())
+            {
+                var task = client.ConnectAsync("127.0.0.1", port);
+                return task.Wait(timeoutMs) && client.Connected;
+            }
+        }
+        catch { return false; }
+    }
+
     // ---------------------------------------------------------------- громкость
 
     private static int VolumeToVlc(int percent)
@@ -1087,6 +1433,13 @@ public sealed class AudioController : IDisposable
         {
             LastError = "громкость: " + e.Message;
         }
+    }
+
+    private void RaiseNoTrack(string name)
+    {
+        var handler = NoTrack;
+        if (handler == null) return;
+        try { handler(name); } catch { }
     }
 
     private void RaiseChanged()

@@ -14,6 +14,7 @@
   <!-- тестируем чистую логику из основного проекта, не дублируя код -->
   <ItemGroup>
     <Compile Include="..\..\src\VLCVideoWall\Model.cs" Link="Model.cs" />
+    <Compile Include="..\..\src\VLCVideoWall\StreamProbe.cs" />
     <Compile Include="..\..\src\VLCVideoWall\AudioController.cs" Link="AudioController.cs" />
     <Compile Include="..\..\src\VLCVideoWall\ProcessVolume.cs" Link="ProcessVolume.cs" />
     <Compile Include="..\..\src\VLCVideoWall\AudioPlaylist.cs" Link="AudioPlaylist.cs" />

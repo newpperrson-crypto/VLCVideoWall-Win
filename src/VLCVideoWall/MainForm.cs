@@ -49,6 +49,10 @@ public class MainForm : Form
 
     /// <summary>Нужен перезапуск стены, чтобы включился звук из её потока.</summary>
     private bool _wallAudioRestartNeeded;
+
+    /// <summary>Режим локальной копии потока, с которым запущена стена.</summary>
+
+    /// <summary>Нужен перезапуск стены, чтобы включилась локальная копия потока.</summary>
     private Label _audioHint;
     private Label _portHint;
     private ComboBox _cmbBadgeCorner;
@@ -61,7 +65,7 @@ public class MainForm : Form
     private ComboBox _canvasPreset;
     private NumericUpDown _canvasW, _canvasH;
     private Label _canvasInfo;
-    private DataGridView _grid;
+    private CameraGrid _grid;
     private Button _btnAdd, _btnDel, _btnUp, _btnDown, _btnProbe;
 
     // --- вкладка «Журнал»
@@ -128,6 +132,9 @@ public class MainForm : Form
         // значки звука поверх плиток: отдельные окна, потому что VLC рисует мозаику полотном
         _wallBadges.Toggled += pos => ToggleAudioByIndex(pos);
         _audio.Changed += RefreshAudioUi;
+        // камера оказалась без звуковой дорожки: галочку снимаем, об этом сообщаем.
+        // проверка идёт в фоне, поэтому всё, что трогает интерфейс и настройки, — через UI-поток
+        _audio.NoTrack += name => OnNoTrack(name);
         // громкость в режиме «звук из потока стены» ставится сеансу нашего VLC в Windows
         _audio.WallVlcPid = () => _wall.OwnVlcPid();
         _audioTimer = new System.Windows.Forms.Timer { Interval = 700 };
@@ -258,7 +265,7 @@ public class MainForm : Form
         int rows = (int)_rows.Value;
         int cw = _canvasW != null ? (int)_canvasW.Value : 1920;
         int chh = _canvasH != null ? (int)_canvasH.Value : 1080;
-        var names = _cameras.Where(c => c.Enabled).Select(c => c.Name).ToList();
+        var names = WallCameraNames();
 
         var cells = new string[cols * rows];
         for (int i = 0; i < cells.Length; i++)
@@ -272,20 +279,17 @@ public class MainForm : Form
         _preview.Invalidate();
         if (_preview != null)
         {
-            var namesNow = _cameras.Where(c => c.Enabled).Select(c => c.Name).ToList();
+            var namesNow = WallCameraNames();
             _preview.AudioSupport = _audio.Enabled;
             var on = new bool[namesNow.Count];
             var track = new AudioTrackState[namesNow.Count];
-            var busy = new bool[namesNow.Count];
             for (int i = 0; i < namesNow.Count; i++)
             {
                 on[i] = _audio.IsOn(namesNow[i]);
                 track[i] = _audio.TrackState(namesNow[i]);
-                busy[i] = _audio.IsBusy(namesNow[i]);
             }
             _preview.AudioOn = on;
             _preview.AudioTrack = track;
-            _preview.AudioBusy = busy;
             _preview.AudioTrackKnown = _wall.IsRunning;
         }
 
@@ -371,7 +375,7 @@ public class MainForm : Form
         fl2.Controls.AddRange(new Control[] { _btnAdd, _btnDel, _btnUp, _btnDown, _btnProbe });
         bar.Controls.Add(fl2);
 
-        _grid = new DataGridView
+        _grid = new CameraGrid
         {
             Dock = DockStyle.Fill,
             AutoGenerateColumns = false,
@@ -387,6 +391,13 @@ public class MainForm : Form
             AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.None
         };
         _grid.Columns.Add(new DataGridViewCheckBoxColumn { DataPropertyName = "Enabled", HeaderText = "Вкл", Width = 44, SortMode = DataGridViewColumnSortMode.NotSortable });
+        // Ctrl+C копирует только адрес: перехват внутри CameraGrid.ProcessCmdKey
+        _grid.UrlForCurrentRow = () =>
+        {
+            var row = _grid.CurrentRow;
+            var cam = row == null ? null : row.DataBoundItem as Camera;
+            return cam == null ? null : cam.Url;
+        };
         _grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = "Name", HeaderText = "Канал", Width = 82, SortMode = DataGridViewColumnSortMode.NotSortable });
         _grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = "Url", HeaderText = "RTSP-адрес", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, SortMode = DataGridViewColumnSortMode.NotSortable });
         _grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = "Check", HeaderText = "Проверка", Width = 230, ReadOnly = true, SortMode = DataGridViewColumnSortMode.NotSortable });
@@ -546,6 +557,22 @@ public class MainForm : Form
         };
         audioRow.Controls.Add(_numAudioVolume);
         audioRow.Controls.Add(new Label { Text = "%", AutoSize = true, Margin = new Padding(2, 8, 0, 0) });
+
+        // перепроверка дорожек: пригодится, если к камере подключили микрофон
+        var btnRecheck = new Button
+        {
+            Text = "Проверить звук у камер", AutoSize = true, FlatStyle = FlatStyle.System,
+            Margin = new Padding(14, 4, 0, 0)
+        };
+        btnRecheck.Click += (s, e) =>
+        {
+            if (!_audio.Enabled) { LogUi("сначала включите поддержку звука"); return; }
+            _audio.ClearNoTrack();
+            SaveAudioState();
+            if (_wall.IsRunning) { _audio.ProbeStreams(); LogUi("проверяю звуковые дорожки у камер…"); }
+            RefreshAudioUi();
+        };
+        audioRow.Controls.Add(btnRecheck);
 
         _audioHint = new Label { AutoSize = true, ForeColor = Color.FromArgb(93, 107, 127), Margin = new Padding(18, 8, 0, 0) };
         audioRow.Controls.Add(_audioHint);
@@ -727,7 +754,7 @@ public class MainForm : Form
             _audio.Enabled = _app.AudioEnabled;
             _audio.Volume = Math.Clamp(_app.AudioVolume, 0, 100);
             _audio.VisibleCount = Math.Max(1, _cfg.Cols) * Math.Max(1, _cfg.Rows);
-            _audio.SetCameras(_cameras);
+            SyncAudioCameras();
             _audio.RestoreStates(_app.AudioChannels);
             _chkLogAuto.Checked = _app.LogAutoRefresh;
 
@@ -855,11 +882,17 @@ public class MainForm : Form
     private void ToggleAudioByIndex(int index)
     {
         if (!_audio.Enabled) return;
-        var names = _cameras.Where(c => c.Enabled).Select(c => c.Name).ToList();
+        var names = WallCameraNames();
         if (index < 0 || index >= names.Count) return;
 
         // на остановленной стене переключатель только запоминает настройку
-        if (!_audio.Toggle(names[index], _wall.IsRunning)) { UpdateAudioHint(); return; }
+        if (!_audio.Toggle(names[index], _wall.IsRunning))
+        {
+            if (_audio.TrackState(names[index]) == AudioTrackState.Absent)
+                LogUi("у камеры " + names[index] + " в потоке нет звуковой дорожки — включать нечего");
+            UpdateAudioHint();
+            return;
+        }
 
         SaveAudioState();
         RefreshAudioUi();          // сразу показываем «принято» — значок становится Busy
@@ -870,13 +903,14 @@ public class MainForm : Form
     {
         if (_loading) return;
         _audio.Enabled = _chkAudio.Checked;
-        _audio.SetCameras(_cameras);
+        SyncAudioCameras();
 
         if (!_audio.Enabled)
         {
             // сначала гасим звук (в режиме стены это mute её процесса), потом меняем режим:
             // иначе DeactivateRuntime уже не знает, что глушить надо стену
             _audio.DeactivateRuntime();
+        _audio.ResetTracks();       // стена стоит — «звука нет» не утверждаем
             _audio.SetWallAudio(false);
         }
         else
@@ -912,10 +946,78 @@ public class MainForm : Form
         _app.AudioEnabled = _audio.Enabled;
         _app.AudioVolume = _audio.Volume;
         _app.AudioChannels = _audio.EnabledChannels();
+        _app.AudioNoTrack = _audio.NoTrackChannels();
         try { _app.Save(_settingsPath); } catch { }
     }
 
     /// <summary>Обновить всё, что показывает звук: макет, значки на стене, подпись.</summary>
+    /// <summary>
+    /// Прочитать карту портов локальных копий (пишет сторож): строки «имя порт».
+    /// Нужна, чтобы порт камеры не зависел от её места в списке и в сетке.
+    /// </summary>
+    private async Task<Dictionary<string, int>> ReadRelayPortsAsync()
+    {
+        var path = Path.Combine(_wall.BaseDir, "relay.ports");
+        var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < 40; i++)
+        {
+            try
+            {
+                if (File.Exists(path))
+                {
+                    map.Clear();
+                    foreach (var line in File.ReadAllLines(path, Encoding.UTF8))
+                    {
+                        var parts = line.Trim().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                        if (parts.Length < 2) continue;
+                        int port;
+                        if (int.TryParse(parts[1], out port) && port >= 1024) map[parts[0]] = port;
+                    }
+                    if (map.Count > 0) return map;
+                }
+            }
+            catch { }
+            await Task.Delay(250);
+        }
+        return map;
+    }
+
+    /// <summary>
+    /// Камеры, которые реально попадают на стену: включены и имеют адрес. Строки без адреса
+    /// (пустые «заготовки» в списке) не занимают плитку — у них не должно быть ни значка
+    /// звука, ни переключателя, иначе пустая ячейка «мигает» чужим состоянием.
+    /// </summary>
+    private List<string> WallCameraNames()
+    {
+        return _cameras.Where(c => c.Enabled && !string.IsNullOrWhiteSpace(c.Url))
+                       .Select(c => c.Name).ToList();
+    }
+
+    /// <summary>У камеры нет звуковой дорожки: снять галочку, сохранить и объяснить.</summary>
+    private void OnNoTrack(string name)
+    {
+        if (InvokeRequired)
+        {
+            try { BeginInvoke(new Action(() => OnNoTrack(name))); } catch { }
+            return;
+        }
+        SaveAudioState();
+        RefreshAudioUi();
+        LogUi("у камеры " + name + " в потоке нет звуковой дорожки — звук выключен");
+    }
+
+    /// <summary>
+    /// Передать движку список камер. Список «звука нет» из настроек намеренно НЕ применяется:
+    /// наличие дорожки проверяется заново при каждом запуске стены, иначе камера, у которой
+    /// звук появился, осталась бы навсегда помеченной.
+    /// </summary>
+    private void SyncAudioCameras()
+    {
+        // только камеры, которые попадают на стену: строки без адреса не занимают плитку
+        var list = _cameras.Where(c => c.Enabled && !string.IsNullOrWhiteSpace(c.Url)).ToList();
+        _audio.SetCameras(list);
+    }
+
     private void RefreshAudioUi()
     {
         if (IsDisposed || Disposing) return;
@@ -1042,7 +1144,7 @@ public class MainForm : Form
             return;
         }
 
-        var names = _cameras.Where(c => c.Enabled).Select(c => c.Name).ToList();
+        var names = WallCameraNames();
         int cols = Math.Max(1, _cfg.Cols);
         int rows = Math.Max(1, _cfg.Rows);
         int canvasW = Math.Max(1, _cfg.CanvasW);
@@ -1076,11 +1178,11 @@ public class MainForm : Form
         if (pos < 0 || pos >= names.Count) return AudioBadgeState.Off;
         var name = names[pos];
 
-        var state = _audio.State(name);
-        if (state == AudioChannelState.Starting || state == AudioChannelState.Recovering || _audio.IsBusy(name))
-            return AudioBadgeState.Busy;
-
+        // три состояния: включён / выключен / недоступен. Промежуточных «точек» нет:
+        // пока процесс не подтвердил звук, значок остаётся выключенным
         if (_audio.TrackState(name) == AudioTrackState.Absent) return AudioBadgeState.NoTrack;
+
+        var state = _audio.State(name);
 
         // Failed намеренно не показываем зелёным: звука нет
         if (state == AudioChannelState.Playing && _audio.IsOn(name)) return AudioBadgeState.On;
@@ -1399,13 +1501,17 @@ public class MainForm : Form
 
             // Звук из потока стены: одна камера на всё полотно. Так камеры с лимитом
             // одного подключения отдают звук — второй сеанс они принимают и молчат.
-            bool wallAudio = AudioController.WallAudioFits(
+            // Локальная копия потока решает то же для любой сетки, поэтому она главнее.
+            // поддержка звука включена — камеры читают коллекторы (одно подключение на камеру)
+            bool relay = _audio.Enabled;
+            _audio.RelayMode = relay;
+            bool wallAudio = !relay && AudioController.WallAudioFits(
                 _audio.Enabled, _cfg.Layout, _cameras.Count(c => c.Enabled && !string.IsNullOrWhiteSpace(c.Url)));
             _audio.SetWallAudio(wallAudio);
             _wallAudioActive = wallAudio;
             _wallAudioRestartNeeded = false;
 
-            await _wall.StartAsync(wallAudio);
+            await _wall.StartAsync(wallAudio, relay);
 
             var sw = Stopwatch.StartNew();
             while (sw.ElapsedMilliseconds < 6000 && !_wall.IsGuardAlive()) await Task.Delay(200);
@@ -1422,10 +1528,14 @@ public class MainForm : Form
             // звук: движок разрешён только после успешного старта стены
             if (_audio.Enabled)
             {
-                _audio.SetCameras(_cameras);
+                SyncAudioCameras();
                 _audio.SetBasePort(_cfg.PortAudio);
+                _audio.SetRelayPorts(await ReadRelayPortsAsync());
+                // дорожки проверяем каждый запуск заново, по локальным копиям потока,
+                // и только потом поднимаем звук — чтобы камера без звука не мигнула «включено»
+                _audio.ClearNoTrack();
+                await _audio.ProbeStreamsAsync();
                 _audio.ActivateRuntime();
-                _audio.ProbeTracks();
             }
             RefreshAudioUi();
         }
@@ -1582,6 +1692,7 @@ public class MainForm : Form
         _app.AudioEnabled = _audio.Enabled;
         _app.AudioVolume = _audio.Volume;
         _app.AudioChannels = _audio.EnabledChannels();
+        _app.AudioNoTrack = _audio.NoTrackChannels();
         _app.MinimizeToTray = _chkTrayMin.Checked;
         _app.CloseToTray = _chkTrayClose.Checked;
         _app.TopMost = _chkTopMost.Checked;

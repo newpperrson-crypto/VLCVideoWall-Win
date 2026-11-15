@@ -56,17 +56,20 @@ internal static class Program
         // файл с BOM (так пишет PowerShell) не должен превращаться в настройки по умолчанию:
         // иначе выключенный звук выглядит как «звук пропал»
         var bomPath = Path.Combine(Path.GetTempPath(), "vw-bom-" + Guid.NewGuid().ToString("N") + ".json");
-        var json = "{\"AudioEnabled\":true,\"AudioVolume\":55,\"AudioChannels\":[\"ch2\"]}";
+        var json = "{\"AudioEnabled\":true,\"AudioVolume\":55,\"AudioChannels\":[\"ch2\"],\"RelayAudio\":true}";
         File.WriteAllText(bomPath, json, new UTF8Encoding(true));
         var fromBom = AppSettings.Load(bomPath);
         Check(fromBom.AudioEnabled, "настройки с BOM читаются: поддержка звука включена");
         Check(fromBom.AudioVolume == 55, "настройки с BOM читаются: громкость");
         Check(fromBom.AudioChannels.Contains("ch2"), "настройки с BOM читаются: включённые камеры");
+        Check(fromBom.RelayAudio, "настройки с BOM читаются: локальная копия");
         try { File.Delete(bomPath); } catch { }
 
         Console.WriteLine("порты звука:");
         AudioPorts();
         WallAudioMode();
+        AudioTrackDetection();
+        StreamProbeChecks();
 
         Console.WriteLine("RTSP-проверка:");
         ProbeBasicOk();
@@ -231,6 +234,139 @@ internal static class Program
     }
 
     /// <summary>
+    /// Проверка дорожек по локальной копии: собираем синтетический MPEG-TS (PAT + PMT)
+    /// и смотрим, что разбор находит звук там, где он есть, и не находит там, где нет.
+    /// </summary>
+    private static void StreamProbeChecks()
+    {
+        // PMT с видео H.264 и звуком AC3 (как у ch1)
+        var withAudio = Ts(0x1b, 0x06);
+        Check(StreamProbe.Analyze(withAudio) == AudioTrackState.Present,
+            "копия с видео и звуком: дорожка найдена");
+
+        // PMT только с видео H.264
+        var videoOnly = Ts(0x1b);
+        Check(StreamProbe.Analyze(videoOnly) == AudioTrackState.Absent,
+            "копия только с видео: звука нет");
+
+        // PMT только с HEVC — вторая камера
+        Check(StreamProbe.Analyze(Ts(0x24)) == AudioTrackState.Absent,
+            "копия HEVC без звука: звука нет");
+
+        // PMT с видео и MP2
+        Check(StreamProbe.Analyze(Ts(0x1b, 0x03)) == AudioTrackState.Present,
+            "MP2 в копии тоже считается звуком");
+
+        // мусор и пустота
+        Check(StreamProbe.Analyze(new byte[188]) == AudioTrackState.Unknown,
+            "нулевые байты — вывод не делается");
+        Check(StreamProbe.Analyze(null) == AudioTrackState.Unknown,
+            "нет данных — вывод не делается");
+    }
+
+    /// <summary>Синтетический поток: PAT + PMT с перечисленными типами дорожек.</summary>
+    private static byte[] Ts(params byte[] streamTypes)
+    {
+        const int pmtPid = 0x1000;
+        var packets = new List<byte[]>();
+
+        // --- PAT ---
+        var pat = new byte[188];
+        Array.Fill(pat, (byte)0xff);
+        pat[0] = 0x47;
+        pat[1] = 0x40;                     // payload_unit_start, PID 0
+        pat[2] = 0x00;
+        pat[3] = 0x10;                     // payload only
+        int p = 4;
+        pat[p++] = 0x00;                   // pointer_field
+        pat[p++] = 0x00;                   // table_id PAT
+        int patStart = p;
+        p += 2;                            // section_length (потом)
+        pat[p++] = 0x00; pat[p++] = 0x01;  // transport_stream_id
+        pat[p++] = 0xc1;                   // version/current
+        pat[p++] = 0x00; pat[p++] = 0x00;  // section numbers
+        pat[p++] = 0x00; pat[p++] = 0x01;  // program_number 1
+        pat[p++] = (byte)(0xe0 | (pmtPid >> 8));
+        pat[p++] = (byte)(pmtPid & 0xff);
+        int patLen = p - patStart - 2 + 4;
+        pat[patStart] = (byte)(0xb0 | ((patLen >> 8) & 0x0f));
+        pat[patStart + 1] = (byte)(patLen & 0xff);
+        p += 4;                            // CRC
+        packets.Add(pat);
+
+        // --- PMT ---
+        var pmt = new byte[188];
+        Array.Fill(pmt, (byte)0xff);
+        pmt[0] = 0x47;
+        pmt[1] = (byte)(0x40 | (pmtPid >> 8));
+        pmt[2] = (byte)(pmtPid & 0xff);
+        pmt[3] = 0x10;
+        int q = 4;
+        pmt[q++] = 0x00;                   // pointer_field
+        pmt[q++] = 0x02;                   // table_id PMT
+        int pmtStart = q;
+        q += 2;
+        pmt[q++] = 0x00; pmt[q++] = 0x01;  // program_number
+        pmt[q++] = 0xc1;
+        pmt[q++] = 0x00; pmt[q++] = 0x00;
+        pmt[q++] = 0xe1; pmt[q++] = 0x00;  // PCR_PID
+        pmt[q++] = 0xf0; pmt[q++] = 0x00;  // program_info_length = 0
+        byte pid = 0x40;
+        foreach (var type in streamTypes)
+        {
+            pmt[q++] = type;
+            pmt[q++] = (byte)(0xe0 | (pid >> 8));
+            pmt[q++] = (byte)(pid & 0xff);
+            pmt[q++] = 0xf0; pmt[q++] = 0x00;   // ES_info_length = 0
+            pid++;
+        }
+        int pmtLen = q - pmtStart - 2 + 4;
+        pmt[pmtStart] = (byte)(0xb0 | ((pmtLen >> 8) & 0x0f));
+        pmt[pmtStart + 1] = (byte)(pmtLen & 0xff);
+        q += 4;                            // CRC
+        packets.Add(pmt);
+
+        // пустой пакет (PID 0x1FFF): нужен третий пакет, иначе выравнивание по трём
+        // sync-байтам не подтвердится и разбор честно вернёт «неизвестно»
+        var pad = new byte[188];
+        Array.Fill(pad, (byte)0xff);
+        pad[0] = 0x47;
+        pad[1] = 0x1f;
+        pad[2] = 0xff;
+        pad[3] = 0x10;
+        packets.Add(pad);
+
+        var result = new byte[packets.Count * 188];
+        for (int i = 0; i < packets.Count; i++) Array.Copy(packets[i], 0, result, i * 188, 188);
+        return result;
+    }
+
+    /// <summary>
+    /// Определение звуковой дорожки по status.xml процесса VLC: значения кодеков всегда
+    /// по-английски, имена полей локализованы, кавычки в XML одинарные.
+    /// </summary>
+    private static void AudioTrackDetection()
+    {
+        var withAudio = "<information><category name='Поток 1'><info name='Кодек'>MPEG-4 Video (mp4v)</info></category>" +
+                        "<category name='Поток 0'><info name='Частота дискретизации'>48000 Гц</info>" +
+                        "<info name='Кодек'>A52 Audio (aka AC3) (a52 )</info></category></information>";
+        Check(AudioController.StreamHasAudio(withAudio) == true, "поток со звуком определяется как «звук есть»");
+
+        // HEVC-камера без звука: в описании кодека нет слова «Video», а «Тип» локализован
+        var hevcOnly = "<information><category name='Поток 0'><info name='Идентификатор оригинала'>100</info>" +
+                       "<info name='Кодек'>MPEG-H Part2/HEVC (H.265) (hevc)</info><info name='Тип'>Видео</info></category></information>";
+        Check(AudioController.StreamHasAudio(hevcOnly) == false,
+            "HEVC-поток без звука — «звука нет» (по «Тип=Видео» и по hevc)");
+
+        var videoOnly = "<information><category name='Поток 0'><info name='Кодек'>MPEG-4 Video (mp4v)</info></category></information>";
+        Check(AudioController.StreamHasAudio(videoOnly) == false, "поток только с видео — «звука нет»");
+
+        Check(AudioController.StreamHasAudio("") == null, "пустой ответ ничего не утверждает");
+        Check(AudioController.StreamHasAudio("<information></information>") == null,
+              "без описания дорожек вывода нет");
+    }
+
+    /// <summary>
     /// Режим «звук из потока стены»: одна камера на всё полотно. Камеры с лимитом
     /// одного RTSP-подключения отдают звук только так, второй процесс остаётся немым.
     /// </summary>
@@ -282,6 +418,12 @@ internal static class Program
             Check(audio.State("A") == AudioChannelState.Playing, "видимая камера — звук включён");
             Check(audio.State("B") == AudioChannelState.Off, "невидимая камера звуком стены не управляет");
         }
+
+        // порты локальной копии: сразу за диапазоном звука, по номеру окна
+        Check(AudioController.RelayPortFor(4213, 0) == 4229, "локальная копия первой камеры — 4229");
+        Check(AudioController.RelayPortFor(4213, 15) == 4244, "локальная копия 16-й камеры — 4244");
+        Check(AudioController.RelayPortFor(4313, 0) == 4329, "смена базового порта сдвигает и копии");
+        Check(AudioController.RelayPortFor(4213, 0) > 4213 + 15, "порты копий не пересекаются со звуком");
     }
 
     private static void AudioPorts()
