@@ -24,6 +24,8 @@ VLCVideoWall.settings.json
 VideoWall.settings.json
 
 # служебные файлы запущенной стены
+relay.ports
+relay-temp/
 vlc.pid
 watchdog.heartbeat
 watchdog.status

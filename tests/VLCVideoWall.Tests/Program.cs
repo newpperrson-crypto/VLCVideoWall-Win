@@ -239,8 +239,13 @@ internal static class Program
     /// </summary>
     private static void StreamProbeChecks()
     {
-        // PMT с видео H.264 и звуком AC3 (как у ch1)
-        var withAudio = Ts(0x1b, 0x06);
+        // PMT с видео H.264 и звуком AC3 — как в реальном потоке коллектора:
+        // VLC кладёт AC-3 в частный тип 0x06 с дескриптором 0x6a и регистрацией «AC-3»
+        var withAudio = TsWithDesc(new List<(byte, byte[])>
+        {
+            (0x1b, Array.Empty<byte>()),
+            (0x06, new byte[] { 0x05, 0x04, 0x41, 0x43, 0x2d, 0x33, 0x6a, 0x01, 0x00 })
+        });
         Check(StreamProbe.Analyze(withAudio) == AudioTrackState.Present,
             "копия с видео и звуком: дорожка найдена");
 
@@ -257,6 +262,36 @@ internal static class Program
         Check(StreamProbe.Analyze(Ts(0x1b, 0x03)) == AudioTrackState.Present,
             "MP2 в копии тоже считается звуком");
 
+        // AC-3 внутри частного типа 0x06 распознаётся по дескриптору (так его пишет VLC)
+        var ac3Desc = new List<(byte, byte[])>
+        {
+            (0x1b, Array.Empty<byte>()),
+            (0x06, new byte[] { 0x05, 0x04, 0x41, 0x43, 0x2d, 0x33, 0x6a, 0x01, 0x00 })
+        };
+        Check(StreamProbe.Analyze(TsWithDesc(ac3Desc)) == AudioTrackState.Present,
+            "AC-3 в типе 0x06 по дескриптору — звук найден");
+
+        // частный тип без дескрипторов ничего не доказывает
+        var privateNoDesc = new List<(byte, byte[])>
+        {
+            (0x1b, Array.Empty<byte>()),
+            (0x06, Array.Empty<byte>())
+        };
+        Check(StreamProbe.Analyze(TsWithDesc(privateNoDesc)) == AudioTrackState.Unknown,
+            "частный тип без дескрипторов — «неизвестно», а не «звук есть»");
+
+        // субтитры и данные — не звук
+        var videoPlusSubtitle = new List<(byte, byte[])>
+        {
+            (0x1b, Array.Empty<byte>()),
+            (0x86, Array.Empty<byte>())
+        };
+        Check(StreamProbe.Analyze(TsWithDesc(videoPlusSubtitle)) == AudioTrackState.Absent,
+            "видео и субтитры без звука — «звука нет»");
+
+        Check(StreamProbe.Analyze(Ts((byte)0x86)) == AudioTrackState.Unknown,
+            "только субтитры — вывода нет");
+
         // мусор и пустота
         Check(StreamProbe.Analyze(new byte[188]) == AudioTrackState.Unknown,
             "нулевые байты — вывод не делается");
@@ -266,6 +301,14 @@ internal static class Program
 
     /// <summary>Синтетический поток: PAT + PMT с перечисленными типами дорожек.</summary>
     private static byte[] Ts(params byte[] streamTypes)
+    {
+        var items = new List<(byte type, byte[] info)>();
+        foreach (var t0 in streamTypes) items.Add((t0, Array.Empty<byte>()));
+        return TsWithDesc(items);
+    }
+
+    /// <summary>Синтетический поток с дескрипторами дорожек (для AC-3 в частном типе 0x06).</summary>
+    private static byte[] TsWithDesc(List<(byte type, byte[] info)> streams)
     {
         const int pmtPid = 0x1000;
         var packets = new List<byte[]>();
@@ -312,12 +355,15 @@ internal static class Program
         pmt[q++] = 0xe1; pmt[q++] = 0x00;  // PCR_PID
         pmt[q++] = 0xf0; pmt[q++] = 0x00;  // program_info_length = 0
         byte pid = 0x40;
-        foreach (var type in streamTypes)
+        foreach (var s in streams)
         {
-            pmt[q++] = type;
+            var info = s.info ?? Array.Empty<byte>();
+            pmt[q++] = s.type;
             pmt[q++] = (byte)(0xe0 | (pid >> 8));
             pmt[q++] = (byte)(pid & 0xff);
-            pmt[q++] = 0xf0; pmt[q++] = 0x00;   // ES_info_length = 0
+            pmt[q++] = (byte)(0xf0 | ((info.Length >> 8) & 0x0f));
+            pmt[q++] = (byte)(info.Length & 0xff);
+            foreach (var b in info) pmt[q++] = b;
             pid++;
         }
         int pmtLen = q - pmtStart - 2 + 4;
@@ -482,8 +528,14 @@ internal static class Program
             audio.SetBasePort(65000);
             Check(audio.BasePort == 65000, "допустимый базовый порт не обрезается");
             audio.SetBasePort(70000);
-            Check(audio.BasePort == 65535 - AudioController.PortSpanSize,
-                "базовый порт не выходит за 65535 вместе с диапазоном");
+            Check(audio.BasePort == 65504,
+                "базовый порт не выходит за 65535 вместе с диапазоном звука и копий (максимум 65504)");
+            Check(AudioController.MaxBasePort == 65504, "предельный базовый порт — 65504");
+            audio.SetBasePort(65504);
+            int lastRelay = AudioController.RelayPortFor(65504, 15);
+            Check(lastRelay == 65535, "порт последней копии при 16 камерах не выходит за 65535");
+            audio.SetBasePort(65505);
+            Check(audio.BasePort == 65504, "65505 обрезается до 65504");
 
             // за 16 камер порт не должен совпасть
             var many = new List<Camera>();

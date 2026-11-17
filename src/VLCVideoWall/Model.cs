@@ -94,7 +94,7 @@ public class WallConfig
             if (t.StartsWith("port_audio") && eq > 0)
             {
                 int v;
-                if (int.TryParse(t.Substring(eq + 1).Trim(), out v) && v >= 1024 && v <= 65535) cfg.PortAudio = v;
+                if (int.TryParse(t.Substring(eq + 1).Trim(), out v) && v >= 1024 && v <= AudioController.MaxBasePort) cfg.PortAudio = v;
                 continue;
             }
             if (t.StartsWith("windowed") && eq > 0)

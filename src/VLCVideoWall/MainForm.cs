@@ -1,6 +1,8 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -45,10 +47,11 @@ public class MainForm : Form
     private NumericUpDown _numAudioVolume;
 
     /// <summary>Режим звука, с которым запущена стена (задаётся при старте).</summary>
-    private bool _wallAudioActive;
 
     /// <summary>Нужен перезапуск стены, чтобы включился звук из её потока.</summary>
     private bool _wallAudioRestartNeeded;
+    // режим, с которым реально запущена стена: локальные копии включены или нет
+    private bool _relayActive;
 
     /// <summary>Режим локальной копии потока, с которым запущена стена.</summary>
 
@@ -596,7 +599,7 @@ public class MainForm : Form
         _numPortGuard.ValueChanged += (s, e) => { if (!_loading) UpdatePortHint(); };
         portRow.Controls.Add(_numPortGuard);
         portRow.Controls.Add(new Label { Text = "звук", AutoSize = true, Margin = new Padding(14, 8, 6, 0) });
-        _numPortAudio = MakePortBox();
+        _numPortAudio = MakePortBox(AudioController.MaxBasePort);
         _numPortAudio.ValueChanged += (s, e) => { if (!_loading) UpdatePortHint(); };
         portRow.Controls.Add(_numPortAudio);
         _portHint = new Label { AutoSize = true, ForeColor = Color.FromArgb(93, 107, 127), Margin = new Padding(14, 8, 0, 0) };
@@ -740,7 +743,7 @@ public class MainForm : Form
 
             _numPortWall.Value = Math.Clamp(_cfg.PortWall, 1024, 65535);
             _numPortGuard.Value = Math.Clamp(_cfg.PortGuard, 1024, 65535);
-            _numPortAudio.Value = Math.Clamp(_cfg.PortAudio, 1024, 65535);
+            _numPortAudio.Value = Math.Clamp(_cfg.PortAudio, 1024, AudioController.MaxBasePort);
             _wall.VlcHttpPort = _cfg.PortWall;
             _wall.GuardPort = _cfg.PortGuard;
             _audio.BasePort = _cfg.PortAudio;
@@ -904,36 +907,33 @@ public class MainForm : Form
         if (_loading) return;
         _audio.Enabled = _chkAudio.Checked;
         SyncAudioCameras();
+        _audio.SetWallAudio(false);     // отдельного режима «звук стены» больше нет
+
+        // Режим стены (через локальные копии или напрямую) выбирается при её запуске.
+        // Пока стена работает в другом режиме, включать звук нельзя: звуковые процессы
+        // подключились бы к камере вторым сеансом — именно то, от чего ушли.
+        bool desiredRelay = _audio.Enabled;
+        bool needsRestart = _wall.IsRunning && desiredRelay != _relayActive;
 
         if (!_audio.Enabled)
         {
-            // сначала гасим звук (в режиме стены это mute её процесса), потом меняем режим:
-            // иначе DeactivateRuntime уже не знает, что глушить надо стену
+            _audio.DeactivateRuntime();      // выключение безопасно в любом режиме
+            _audio.ResetTracks();
+        }
+        else if (needsRestart)
+        {
+            // помним настройку, но не запускаем движок до перезапуска стены
             _audio.DeactivateRuntime();
-        _audio.ResetTracks();       // стена стоит — «звука нет» не утверждаем
-            _audio.SetWallAudio(false);
+            LogUi("звук включён — он заработает после перезапуска стены (нужны локальные копии потоков)");
         }
         else
         {
-            int cams = _cameras.Count(c => c.Enabled && !string.IsNullOrWhiteSpace(c.Url));
-            bool desired = AudioController.WallAudioFits(true, _cfg.Layout, cams);
-            if (_wall.IsRunning && desired != _wallAudioActive && desired)
-            {
-                // режим звука задаётся при запуске стены: без перезапуска он не включится
-                _wallAudioRestartNeeded = true;
-            }
-            else
-            {
-                _audio.SetWallAudio(desired && _wallAudioActive);
-                _wallAudioRestartNeeded = false;
-            }
-
-            // движок включаем только у работающей стены: на остановленной звук не стартует
             if (_wall.IsRunning) _audio.ActivateRuntime();
             else _audio.DeactivateRuntime();
             _audio.ProbeTracks();
         }
 
+        _wallAudioRestartNeeded = needsRestart;
         SaveAudioState();
         RefreshAudioUi();
         UpdatePreview();
@@ -1027,12 +1027,12 @@ public class MainForm : Form
         UpdateAudioHint();
     }
 
-    private static NumericUpDown MakePortBox()
+    private static NumericUpDown MakePortBox(int max = 65535)
     {
         return new NumericUpDown
         {
             Minimum = 1024,
-            Maximum = 65535,
+            Maximum = max,
             Increment = 1,
             Width = 76,
             Margin = new Padding(0, 4, 0, 0)
@@ -1063,7 +1063,11 @@ public class MainForm : Form
         RefreshAudioUi();
     }
 
-    /// <summary>Проверка портов: значения разные и звук не попадает на порты стены и сторожа.</summary>
+    /// <summary>
+    /// Проверка портов. Звук занимает два диапазона: 16 портов звуковых процессов и сразу
+    /// за ними 16 портов локальных копий, то есть целиком [audio … audio+31]. Управляющие
+    /// порты (стена и сторож) не должны попадать ни в один из них.
+    /// </summary>
     private bool PortsOk(out string problem)
     {
         problem = null;
@@ -1071,27 +1075,157 @@ public class MainForm : Form
         int guard = (int)_numPortGuard.Value;
         int audio = (int)_numPortAudio.Value;
 
+        int audioLast = audio + AudioController.PortSpanSize * 2 - 1;   // +16 звука и +16 копий
+
         if (wall == guard || wall == audio || guard == audio)
         {
             problem = "Порты должны быть разными.";
             return false;
         }
-        if (audio + 15 >= guard && audio <= guard)
+        if (audio < 1024)
         {
-            problem = "Диапазон звука (" + audio + "…" + (audio + 15) + ") пересекается с портом сторожа.";
+            problem = "Порт звука не может быть меньше 1024.";
             return false;
         }
-        if (audio + 15 >= wall && audio <= wall)
+        if (audioLast > 65535)
         {
-            problem = "Диапазон звука (" + audio + "…" + (audio + 15) + ") пересекается с портом стены.";
+            problem = "Слишком большой порт звука: диапазон звука и локальных копий занимает 32 порта, "
+                    + "максимум — " + (65535 - AudioController.PortSpanSize * 2 + 1) + ".";
             return false;
         }
-        if (wall > 65535 - 20 || audio > 65535 - 16)
+        if (guard >= audio && guard <= audioLast)
         {
-            problem = "Слишком близко к 65535: нужно место для диапазона звука.";
+            problem = "Диапазон звука и копий (" + audio + "…" + audioLast + ") пересекается с портом сторожа "
+                    + guard + ".";
+            return false;
+        }
+        if (wall >= audio && wall <= audioLast)
+        {
+            problem = "Диапазон звука и копий (" + audio + "…" + audioLast + ") пересекается с портом стены "
+                    + wall + ".";
+            return false;
+        }
+        if (wall > 65535 || guard > 65535)
+        {
+            problem = "Порт должен быть не больше 65535.";
             return false;
         }
         return true;
+    }
+
+    /// <summary>
+    /// Проверка, что нужные порты свободны: стена, сторож и диапазон звука с копиями.
+    /// Занятый порт — это чужая программа (свой VLC к этому моменту уже остановлен),
+    /// и запуск с ним дал бы «зелёный» статус при неработающей стене.
+    /// </summary>
+    private bool PortsFree(out string problem)
+    {
+        problem = null;
+        int wall = (int)_numPortWall.Value;
+        int guard = (int)_numPortGuard.Value;
+        int audio = (int)_numPortAudio.Value;
+        int cams = Math.Min(16, _cameras.Count(c => c.Enabled && !string.IsNullOrWhiteSpace(c.Url)));
+
+        var busy = new List<string>();
+
+        // свой VLC от прошлого запуска (сторож упал) — не «чужая программа»: гасим и продолжаем
+        if (!IsPortFree(wall) && IsOwnVlcOnPort(wall, out int wallPid))
+        {
+            LogUi("порт " + wall + " держит VLC стены от прошлого запуска — останавливаю его");
+            try { Process.GetProcessById(wallPid).Kill(); Thread.Sleep(600); } catch { }
+        }
+        if (!IsPortFree(wall)) busy.Add(wall + " (стена)");
+
+        if (!IsPortFree(guard)) busy.Add(guard + " (сторож)");
+
+        for (int i = 0; i < cams; i++)
+        {
+            int audioPort = audio + i;
+            int relayPort = audio + AudioController.PortSpanSize + i;
+
+            if (!IsPortFree(audioPort) && IsOwnVlcOnPort(audioPort, out int audioPid))
+            {
+                LogUi("порт " + audioPort + " держит звуковой VLC от прошлого запуска — останавливаю его");
+                try { Process.GetProcessById(audioPid).Kill(); Thread.Sleep(300); } catch { }
+            }
+            if (!IsPortFree(audioPort)) busy.Add(audioPort + " (звук)");
+
+            // локальную копию от прошлого запуска сторож подхватывает сам, поэтому порт не считаем занятым
+            if (!IsPortFree(relayPort) && !IsOwnVlcOnPort(relayPort, out _)) busy.Add(relayPort + " (локальная копия)");
+        }
+
+        if (busy.Count == 0) return true;
+
+        problem = "Порты уже заняты другой программой: " + string.Join(", ", busy) +
+                  ". Освободите их или укажите другие номера в «Общих настройках».";
+        return false;
+    }
+
+    /// <summary>Держит ли порт наш VLC (тот же exe, что указан в настройках).</summary>
+    private bool IsOwnVlcOnPort(int port, out int pid)
+    {
+        pid = OwnerOfPort(port);
+        if (pid == 0) return false;
+        try
+        {
+            var p = Process.GetProcessById(pid);
+            if (!string.Equals(p.ProcessName, "vlc", StringComparison.OrdinalIgnoreCase)) return false;
+            var exe = EffectiveVlcPath();
+            if (string.IsNullOrWhiteSpace(exe)) return true;      // путь неизвестен — считаем своим по имени
+            var real = p.MainModule == null ? null : p.MainModule.FileName;
+            return string.Equals(real, exe, StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
+    /// <summary>PID процесса, слушающего локальный порт (0 — не найден).</summary>
+    private static int OwnerOfPort(int port)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo("netstat", "-ano -p TCP")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true
+            };
+            using var proc = Process.Start(psi);
+            if (proc == null) return 0;
+            var output = proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit(3000);
+            var marker = ":" + port + " ";
+            foreach (var line in output.Split('\n'))
+            {
+                if (!line.Contains("LISTENING")) continue;
+                if (!line.Contains(marker)) continue;
+                var parts = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length < 5) continue;
+                int pid;
+                if (int.TryParse(parts[parts.Length - 1], out pid)) return pid;
+            }
+        }
+        catch { }
+        return 0;
+    }
+
+    /// <summary>Свободен ли локальный порт (проверяем привязкой, без подключения).</summary>
+    private static bool IsPortFree(int port)
+    {
+        if (port < 1024 || port > 65535) return false;
+        var listener = new TcpListener(IPAddress.Loopback, port);
+        try
+        {
+            listener.Start();
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            try { listener.Stop(); } catch { }
+        }
     }
 
     private void UpdatePortHint()
@@ -1104,7 +1238,12 @@ public class MainForm : Form
             _portHint.ForeColor = Color.FromArgb(185, 28, 28);
             return;
         }
-        _portHint.Text = "звук занимает " + _numPortAudio.Value + "…" + (_numPortAudio.Value + 15) + " · применяется при запуске стены";
+        // звук занимает 16 портов, и сразу за ними идут 16 портов локальных копий
+        int first = (int)_numPortAudio.Value;
+        int audioEnd = first + AudioController.PortSpanSize - 1;
+        int relayEnd = first + AudioController.PortSpanSize * 2 - 1;
+        _portHint.Text = "звук " + first + "…" + audioEnd + " · локальные копии " + (audioEnd + 1) + "…" + relayEnd
+                       + " · применяется при запуске стены";
         _portHint.ForeColor = Color.FromArgb(93, 107, 127);
     }
 
@@ -1497,21 +1636,39 @@ public class MainForm : Form
             _wall.VlcHttpPort = _cfg.PortWall;
             _wall.GuardPort = _cfg.PortGuard;
 
+            // согласованность номеров проверяем перед каждым запуском, а не только при сохранении:
+            // конфиг мог остаться от прежней версии, где диапазон копий не учитывался
+            _numPortWall.Value = Math.Clamp(_cfg.PortWall, 1024, 65535);
+            _numPortGuard.Value = Math.Clamp(_cfg.PortGuard, 1024, 65535);
+            _numPortAudio.Value = Math.Clamp(_cfg.PortAudio, 1024, AudioController.MaxBasePort);
+            string portsProblem;
+            if (!PortsOk(out portsProblem))
+            {
+                Ask(portsProblem + Environment.NewLine + Environment.NewLine +
+                    "Исправьте порты на вкладке «Общие» и сохраните снова.",
+                    "Видеостена", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            // порты, занятые чужой программой, дают «зелёный» статус при неработающей стене
+            string busyProblem;
+            if (!PortsFree(out busyProblem))
+            {
+                Ask(busyProblem, "Видеостена", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
             SetBusy(true);
 
-            // Звук из потока стены: одна камера на всё полотно. Так камеры с лимитом
-            // одного подключения отдают звук — второй сеанс они принимают и молчат.
-            // Локальная копия потока решает то же для любой сетки, поэтому она главнее.
-            // поддержка звука включена — камеры читают коллекторы (одно подключение на камеру)
+            // Поддержка звука включена — камеры читают коллекторы (одно подключение на камеру):
+            // видео идёт стене, звук — звуковым процессам. Иначе стена читает камеры напрямую.
             bool relay = _audio.Enabled;
             _audio.RelayMode = relay;
-            bool wallAudio = !relay && AudioController.WallAudioFits(
-                _audio.Enabled, _cfg.Layout, _cameras.Count(c => c.Enabled && !string.IsNullOrWhiteSpace(c.Url)));
-            _audio.SetWallAudio(wallAudio);
-            _wallAudioActive = wallAudio;
+            _audio.SetWallAudio(false);
+            _relayActive = relay;
             _wallAudioRestartNeeded = false;
 
-            await _wall.StartAsync(wallAudio, relay);
+            await _wall.StartAsync(false, relay);
 
             var sw = Stopwatch.StartNew();
             while (sw.ElapsedMilliseconds < 6000 && !_wall.IsGuardAlive()) await Task.Delay(200);
@@ -1584,7 +1741,7 @@ public class MainForm : Form
             _audio.DeactivateRuntime();                 // запрещаем восстановление до остановки
             try { await _audio.WaitStoppedAsync(6000); } catch { }
             _audio.ResetTracks();     // на остановленной стене состояние дорожек неизвестно
-            _wallAudioActive = false; // режим звука задаётся заново при следующем запуске
+            _relayActive = false;
             _wallAudioRestartNeeded = false;
             SetBusy(false);
             UpdateStatus();

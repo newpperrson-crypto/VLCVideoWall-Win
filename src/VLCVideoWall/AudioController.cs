@@ -186,6 +186,9 @@ public sealed class AudioController : IDisposable
 
     public static int PortSpanSize { get { return PortSpan; } }
 
+    /// <summary>Наибольший допустимый базовый порт: дальше не помещаются 32 порта (звук и копии).</summary>
+    public static int MaxBasePort { get { return 65535 - PortSpan * 2 + 1; } }
+
     /// <summary>Первый порт звуковых процессов. Смена пересчитывает порты каналов.</summary>
     public int BasePort
     {
@@ -369,7 +372,8 @@ public sealed class AudioController : IDisposable
     /// <summary>Сменить базовый порт: порты пересчитываются, живые каналы перезапускаются.</summary>
     public void SetBasePort(int port)
     {
-        int clamped = Math.Clamp(port, 1024, 65535 - PortSpan);
+        // за базовым портом идут 16 портов звука и 16 портов локальных копий
+        int clamped = Math.Clamp(port, 1024, MaxBasePort);
         List<Channel> restart = new List<Channel>();
         lock (_sync)
         {

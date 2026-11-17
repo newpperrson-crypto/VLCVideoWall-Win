@@ -107,67 +107,28 @@ stream.Write(request, 0, request.Length);
         var pmtPids = ReadPatPids(buffer);
         if (pmtPids.Count == 0) return AudioTrackState.Unknown;
 
-        bool sawPmt = false;
+        bool sawVideo = false;
+        bool sawAnyPmt = false;
+        bool sawUnclear = false;
         foreach (var pid in pmtPids)
         {
             var streams = ReadPmtStreams(buffer, pid);
             if (streams == null) continue;
-            sawPmt = true;
-            foreach (var type in streams)
+            sawAnyPmt = true;
+            foreach (var s in streams)
             {
-                if (!VideoTypes.Contains(type)) return AudioTrackState.Present;
+                if (IsAudioStream(s)) return AudioTrackState.Present;
+                if (VideoTypes.Contains(s.Type)) sawVideo = true;
+                else if (s.Type == 0x06) sawUnclear = true;   // частный тип без понятных дескрипторов
             }
         }
-        return sawPmt ? AudioTrackState.Absent : AudioTrackState.Unknown;
-    }
+        if (!sawAnyPmt) return AudioTrackState.Unknown;
 
-    /// <summary>Прочитать начало потока: столько, сколько успеет за отведённое время.</summary>
-    private static byte[] ReadBytes(int port, int timeoutMs)
-    {
-        using var client = new System.Net.Sockets.TcpClient();
-        var connect = client.BeginConnect("127.0.0.1", port, null, null);
-        if (!connect.AsyncWaitHandle.WaitOne(Math.Min(timeoutMs, 3000))) return null;
-        client.EndConnect(connect);
-        client.ReceiveTimeout = Math.Min(timeoutMs, 4000);
-
-        using var stream = client.GetStream();
-        var path = "/" ;   // VLC отдаёт поток по любому пути
-        var request = "GET " + path + " HTTP/1.0\r\nHost: 127.0.0.1\r\nUser-Agent: VLCVideoWall\r\n\r\n";
-        var req = System.Text.Encoding.ASCII.GetBytes(request);
-        stream.Write(req, 0, req.Length);
-        stream.Flush();
-
-        var buffer = new byte[MaxBytes];
-        int total = 0;
-        var started = DateTime.UtcNow;
-        bool headersDone = false;
-        int bodyStart = 0;
-        while (total < MaxBytes)
-        {
-            if ((DateTime.UtcNow - started).TotalMilliseconds > timeoutMs) break;
-            int read;
-            try { read = stream.Read(buffer, total, Math.Min(16 * 1024, MaxBytes - total)); }
-            catch { break; }
-            if (read <= 0) break;
-            total += read;
-            if (!headersDone)
-            {
-                // тело ответа начинается после пустой строки; заголовки могут прийти не сразу
-                var text = System.Text.Encoding.ASCII.GetString(buffer, 0, total);
-                int idx = text.IndexOf("\r\n\r\n", StringComparison.Ordinal);
-                if (idx >= 0) { bodyStart = idx + 4; headersDone = true; }
-            }
-            if (headersDone && total - bodyStart > 32 * 1024)
-            {
-                // PMT обычно приходит в первых килобайтах, но повторяется — читаем ещё немного
-                var found = ReadPatPids(new ArraySegment<byte>(buffer, bodyStart, total - bodyStart).ToArray());
-                if (found.Count > 0) break;
-            }
-        }
-        if (!headersDone) return null;
-        var body = new byte[total - bodyStart];
-        Array.Copy(buffer, bodyStart, body, 0, body.Length);
-        return body;
+        // Видео есть, а звука нет. Но если рядом лежит частный поток, который мы не умеем
+        // опознать (возможно, это и есть звук без дескриптора), — честнее «неизвестно»:
+        // выключать звук пользователю на основании догадки нельзя.
+        if (sawUnclear) return AudioTrackState.Unknown;
+        return sawVideo ? AudioTrackState.Absent : AudioTrackState.Unknown;
     }
 
     /// <summary>
@@ -238,8 +199,48 @@ stream.Write(request, 0, request.Length);
         return result;
     }
 
-    /// <summary>Типы дорожек из PMT указанного PID. null — таблица не найдена.</summary>
-    private static System.Collections.Generic.List<byte> ReadPmtStreams(byte[] data, int pmtPid)
+    /// <summary>Дорожка из PMT: тип по ISO 13818-1 и её дескрипторы.</summary>
+    internal struct PmtStream
+    {
+        public byte Type;
+        public byte[] Info;
+    }
+
+    /// <summary>Типы, которые гарантированно несут звук (MPEG-1/2 audio, AAC, AC-3, E-AC-3).</summary>
+    private static readonly System.Collections.Generic.HashSet<byte> AudioTypes =
+        new() { 0x03, 0x04, 0x0f, 0x11, 0x1c, 0x81, 0x87 };
+
+    /// <summary>
+    /// Аудиодорожка ли это. Частный тип 0x06 (в нём VLC кладёт AC3) распознаётся только
+    /// по дескрипторам: без них утверждать «звук есть» нельзя — там может быть что угодно.
+    /// </summary>
+    private static bool IsAudioStream(PmtStream s)
+    {
+        if (AudioTypes.Contains(s.Type)) return true;
+        if (s.Type != 0x06 || s.Info == null) return false;
+
+        int i = 0;
+        while (i + 2 <= s.Info.Length)
+        {
+            byte tag = s.Info[i];
+            int len = s.Info[i + 1];
+            if (i + 2 + len > s.Info.Length) break;
+
+            if (tag == 0x6a || tag == 0x7a) return true;          // AC-3 / E-AC-3 descriptor
+            if (tag == 0x05 && len >= 4)                          // registration descriptor
+            {
+                var id = System.Text.Encoding.ASCII.GetString(s.Info, i + 2, Math.Min(len, 4)).Trim('\0', ' ');
+                if (id.Equals("AC-3", StringComparison.OrdinalIgnoreCase) ||
+                    id.Equals("EAC3", StringComparison.OrdinalIgnoreCase) ||
+                    id.Equals("E-AC", StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            i += 2 + len;
+        }
+        return false;
+    }
+
+    /// <summary>Дорожки из PMT указанного PID. null — таблица не найдена.</summary>
+    private static System.Collections.Generic.List<PmtStream> ReadPmtStreams(byte[] data, int pmtPid)
     {
         int align = SyncOffset(data);
         if (align < 0) return null;
@@ -256,15 +257,17 @@ stream.Write(request, 0, request.Length);
             int end = Math.Min(p + 3 + sectionLength - 4, i + PacketSize);
             int infoLength = ((data[p + 10] & 0x0f) << 8) | data[p + 11];
             int q = p + 12 + infoLength;
-            var types = new System.Collections.Generic.List<byte>();
+            var streams = new System.Collections.Generic.List<PmtStream>();
             while (q + 5 <= end && q + 5 <= data.Length)
             {
                 byte streamType = data[q];
                 int esInfo = ((data[q + 3] & 0x0f) << 8) | data[q + 4];
-                types.Add(streamType);
+                var info = new byte[Math.Max(0, Math.Min(esInfo, end - (q + 5)))];
+                if (info.Length > 0) Array.Copy(data, q + 5, info, 0, info.Length);
+                streams.Add(new PmtStream { Type = streamType, Info = info });
                 q += 5 + esInfo;
             }
-            return types;
+            return streams;
         }
         return null;
     }

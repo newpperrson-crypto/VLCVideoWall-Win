@@ -55,6 +55,9 @@ $script:AUDIO_FROM_WALL = [bool]$AudioFromWall
 # локальная копия потока: одну камеру читает один процесс, а стена и звук берут
 # видео и звук из этой копии — к камере уходит одно подключение вместо двух
 $script:RELAY = [bool]$Relay
+$RELAY_STABLE_SECONDS = 30   # столько должна проработать копия, чтобы сбросить счётчик
+$RELAY_MAX_FAILS = 5
+$RELAY_BACKOFF = @(5, 15, 45, 120, 300)
 $script:PORT_AUDIO = 4213
 $PROBE_OK_INTERVAL   = 5    # опрос камеры, когда она не отвечает по сети
 $PROBE_SLOW_INTERVAL = 60   # порт открыт, но RTSP молчит
@@ -221,6 +224,11 @@ $script:RELAY_PORT = @{}   # имя канала -> порт локальной 
 $script:RELAY_PROC = @{}   # имя канала -> процесс коллектора
 $script:RELAY_FAILS = @{}  # имя канала -> подряд неудачных запусков
 $script:RELAY_INDEX = @{}  # имя канала -> номер окна (для порта звука коллектора)
+$script:RELAY_STUCK = @{}  # имя канала -> коллектор не завершился (повторный запуск запрещён)
+$script:RELAY_OK = @{}     # имя канала -> время подтверждения полезного потока
+$script:RELAY_NEXT = @{}   # имя канала -> время следующей попытки перезапуска
+$script:RELAY_DEAD = @{}   # имя канала -> восстановление прекращено (исчерпаны попытки)
+$script:RELAY_ADOPTED = @{} # имя канала -> порт занят копией от прошлого запуска
 $script:RELAY_PORTS_FILE = Join-Path $BASE 'relay.ports'
 $script:AUDIO_HTTP  = @{}  # имя канала -> "порт:пароль" интерфейса звука коллектора
 
@@ -234,6 +242,19 @@ function Start-RelayProc($c) {
     if ($script:RELAY_PORT.ContainsKey($c.Name)) { $port = [int]$script:RELAY_PORT[$c.Name] }
     if ($port -lt 1024) { return $null }
 
+    if ($script:RELAY_STUCK.ContainsKey($c.Name)) {
+        Write-Log ('{0}: прежняя локальная копия не завершилась — второй экземпляр не запускаю' -f $c.Name)
+        return $null
+    }
+
+    # порт может держать коллектор от прошлого запуска (сторож упал, VLC остался).
+    # Второй экземпляр на том же порту не поднимаем и чужой процесс не трогаем.
+    if (Test-RelayData $port 1500) {
+        $script:RELAY_ADOPTED[$c.Name] = $true
+        Write-Log ('{0}: порт {1} уже отдаёт поток (копия от прошлого запуска) — новый коллектор не запускаю' -f $c.Name, $port)
+        return $null
+    }
+
     # Коллектор камеры отдаёт ОДИН поток, в котором и видео, и звук:
     #   * камера подключается один раз (второго сеанса она не даёт);
     #   * видео идёт БЕЗ перекодирования: если vcodec не указан, transcode копирует
@@ -243,8 +264,12 @@ function Start-RelayProc($c) {
     $chain = '#transcode{acodec=a52,ab=96,channels=2,samplerate=48000}' +
              ':std{access=http,mux=ts,dst=127.0.0.1:' + $port + '}'
 
+    # адрес с логином и паролем — файлом, а не аргументом командной строки
+    $playlist = Write-RelayPlaylist $c
+    if (-not $playlist) { return $null }
+
     $launch = Get-LaunchDir
-    $argStr = '-I dummy --no-video-title-show --rtsp-tcp --sout-all --sout "' + $chain + '" --sout-keep "' + $c.Url + '"'
+    $argStr = '-I dummy --no-video-title-show --rtsp-tcp --sout-all --sout "' + $chain + '" --sout-keep "' + $playlist + '"'
     try {
         $p = Start-Process -FilePath $script:VLC_EXE -ArgumentList $argStr -WorkingDirectory $launch -PassThru
         $script:RELAY_PROC[$c.Name] = $p
@@ -253,24 +278,81 @@ function Start-RelayProc($c) {
     } catch {
         Write-Log ('{0}: локальная копия не запустилась: {1}' -f $c.Name, $_.Exception.Message)
         $script:RELAY_PROC[$c.Name] = $null
+        Remove-RelayPlaylist $c.Name
         return $null
     }
 }
 
+function Test-ProcessGone($p) {
+    if (-not $p) { return $true }
+    try { return $p.HasExited } catch { return $true }
+}
+
 function Stop-RelayProc([string]$name) {
+    # Ссылку на процесс убираем ТОЛЬКО после подтверждённого завершения: иначе при отказе
+    # Kill() сторож теряет коллектор, а следующий запуск поднимет второй на том же порту.
     $p = $script:RELAY_PROC[$name]
-    $script:RELAY_PROC[$name] = $null
-    if (-not $p) { return }
+    if (-not $p) { Remove-RelayPlaylist $name; $script:RELAY_STUCK.Remove($name); return $true }
+
+    if (Test-ProcessGone $p) {
+        $script:RELAY_PROC.Remove($name)
+        $script:RELAY_STUCK.Remove($name)
+        Remove-RelayPlaylist $name
+        return $true
+    }
+
     try {
-        if (-not $p.HasExited) {
-            $p.Kill()
-            [void]$p.WaitForExit(4000)
-        }
-    } catch { }
+        if (-not $p.HasExited) { $p.Kill() }
+    } catch {
+        Write-Log ('{0}: не удалось завершить локальную копию: {1}' -f $name, $_.Exception.Message)
+    }
+    try { [void]$p.WaitForExit(6000) } catch { }
+
+    if (Test-ProcessGone $p) {
+        $script:RELAY_PROC.Remove($name)
+        $script:RELAY_STUCK.Remove($name)
+        Remove-RelayPlaylist $name
+        return $true
+    }
+
+    $script:RELAY_STUCK[$name] = $true
+    Write-Log ('ВНИМАНИЕ: {0}: локальная копия (pid {1}) не завершилась за 6 с — повторный запуск заблокирован' -f $name, $p.Id)
+    return $false
 }
 
 function Stop-AllRelays {
-    foreach ($n in @($script:RELAY_PROC.Keys)) { Stop-RelayProc $n }
+    # Возвращает число коллекторов, которые не удалось остановить: вызывающий код
+    # обязан сообщить о неполной остановке, а не считать её успешной.
+    $failed = 0
+    foreach ($n in @($script:RELAY_PROC.Keys)) {
+        if (-not (Stop-RelayProc $n)) { $failed++ }
+    }
+
+    # копии, принятые от прошлого запуска: гасим только если это точно наш процесс
+    # (в командной строке наш плейлист этой камеры), чужие не трогаем
+    foreach ($n in @($script:RELAY_ADOPTED.Keys)) {
+        $port = 0
+        if ($script:RELAY_PORT.ContainsKey($n)) { $port = [int]$script:RELAY_PORT[$n] }
+        if ($port -ge 1024) {
+            $owner = 0
+            try {
+                $conn = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($conn) { $owner = [int]$conn.OwningProcess }
+            } catch { }
+            if ($owner -gt 0) {
+                $proc = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $owner) -ErrorAction SilentlyContinue
+                if ($proc -and $proc.CommandLine -like ('*relay-' + $n + '.xspf*')) {
+                    try { Stop-Process -Id $owner -Force -ErrorAction SilentlyContinue; Write-Log ('{0}: остановлена копия от прошлого запуска (pid {1})' -f $n, $owner) } catch { $failed++ }
+                } else {
+                    Write-Log ('{0}: порт {1} занят чужим процессом — не трогаю' -f $n, $port)
+                }
+            }
+        }
+        Remove-RelayPlaylist $n
+    }
+    $script:RELAY_ADOPTED.Clear()
+
+    return $failed
 }
 
 function Initialize-RelayUrls($channels) {
@@ -282,6 +364,100 @@ function Initialize-RelayUrls($channels) {
         $script:RELAY_URL[$c.Name] = 'http://127.0.0.1:' + ($script:PORT_AUDIO + 16 + $i)
         $script:RELAY_INDEX[$c.Name] = $i
         $i++
+    }
+}
+
+function Get-RelayTempDir {
+    # Адрес камеры с логином и паролем не должен попадать в командную строку процесса:
+    # передаём его файлом-плейлистом. Каталог — только для текущего пользователя.
+    $dir = Join-Path (Join-Path $env:LOCALAPPDATA 'VLCVideoWall') 'relay-temp'
+    if (Test-Path -LiteralPath $dir) { return $dir }
+    try {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)
+        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $me, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $acl.AddAccessRule($rule)
+        Set-Acl -LiteralPath $dir -AclObject $acl
+        Write-Log ('каталог плейлистов копий: {0} (доступ только текущему пользователю)' -f $dir)
+    } catch {
+        Write-Log ('не удалось ограничить доступ к каталогу плейлистов: {0}' -f $_.Exception.Message)
+    }
+    return $dir
+}
+
+function Remove-RelayPlaylist([string]$name) {
+    try {
+        $path = Join-Path (Join-Path (Join-Path $env:LOCALAPPDATA 'VLCVideoWall') 'relay-temp') ('relay-' + $name + '.xspf')
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    } catch { }
+}
+
+function Remove-StaleRelayPlaylists {
+    # при старте убираем только свои файлы: чужие каталоги не трогаем
+    try {
+        $dir = Join-Path (Join-Path $env:LOCALAPPDATA 'VLCVideoWall') 'relay-temp'
+        if (-not (Test-Path -LiteralPath $dir)) { return }
+        Get-ChildItem -LiteralPath $dir -Filter 'relay-*.xspf' -File -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    } catch { }
+}
+
+function Write-RelayPlaylist($c) {
+    # VLC читает плейлист сам: в аргументах процесса остаётся только путь
+    try {
+        $dir = Get-RelayTempDir
+        $path = Join-Path $dir ('relay-' + $c.Name + '.xspf')
+        $esc = [System.Security.SecurityElement]::Escape($c.Url)
+        $xml = '<?xml version="1.0" encoding="UTF-8"?>' + "`r`n" +
+               '<playlist xmlns="http://xspf.org/ns/0/" version="1">' + "`r`n" +
+               '  <trackList><track><location>' + $esc + '</location></track></trackList>' + "`r`n" +
+               '</playlist>' + "`r`n"
+        [System.IO.File]::WriteAllText($path, $xml, (New-Object System.Text.UTF8Encoding($false)))
+        return $path
+    } catch {
+        Write-Log ('{0}: не удалось подготовить файл потока: {1}' -f $c.Name, $_.Exception.Message)
+        return $null
+    }
+}
+
+function Test-RelayData([int]$port, [int]$timeoutMs = 1500) {
+    # Живой процесс и открытый порт ещё не значат, что по HTTP идёт поток:
+    # проверяем первые пакеты транспортного потока.
+    if ($port -lt 1024) { return $false }
+    $client = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $iar = $client.BeginConnect('127.0.0.1', $port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne(800)) { return $false }
+        $client.EndConnect($iar)
+        $client.ReceiveTimeout = $timeoutMs
+        $stream = $client.GetStream()
+        $req = [System.Text.Encoding]::ASCII.GetBytes("GET / HTTP/1.0`r`nHost: 127.0.0.1`r`n`r`n")
+        $stream.Write($req, 0, $req.Length)
+        $stream.Flush()
+        $buf = New-Object byte[] 65536
+        $total = 0
+        $deadline = (Get-Date).AddMilliseconds($timeoutMs)
+        while ($total -lt $buf.Length -and (Get-Date) -lt $deadline) {
+            $read = $stream.Read($buf, $total, [Math]::Min(16384, $buf.Length - $total))
+            if ($read -le 0) { break }
+            $total += $read
+        }
+        if ($total -lt 4096) { return $false }
+        # тело ответа начинается после пустой строки; ищем устойчивый TS-признак
+        $text = [System.Text.Encoding]::ASCII.GetString($buf, 0, [Math]::Min($total, 4096))
+        $bodyStart = $text.IndexOf("`r`n`r`n")
+        $offset = 0
+        if ($bodyStart -ge 0) { $offset = $bodyStart + 4 }
+        if ($offset + 376 -ge $total) { return $false }
+        return ($buf[$offset] -eq 0x47 -and $buf[$offset + 188] -eq 0x47 -and $buf[$offset + 376] -eq 0x47)
+    } catch {
+        return $false
+    } finally {
+        if ($client) { try { $client.Close() } catch { } }
     }
 }
 
@@ -901,9 +1077,15 @@ function Complete-Stop($proc, [string]$why) {
     # увидит живой процесс и сообщит, что стена не остановлена.
     Write-Log $why
     if ($script:RELAY) {
-        Stop-AllRelays
-        Remove-Item -LiteralPath $script:RELAY_PORTS_FILE -Force -ErrorAction SilentlyContinue
-        Write-Log 'локальные копии потоков остановлены'
+        $left = Stop-AllRelays
+        if ($left -eq 0) {
+            Remove-Item -LiteralPath $script:RELAY_PORTS_FILE -Force -ErrorAction SilentlyContinue
+            Write-Log 'локальные копии потоков остановлены'
+        } else {
+            # карту портов и сведения о процессах не удаляем: иначе незавершённые копии
+            # станут невидимыми, а их порты останутся занятыми
+            Write-Log ('ВНИМАНИЕ: {0} локальных копий не удалось остановить — сведения сохранены' -f $left)
+        }
     }
     $stopped = Stop-MosaicVlc $proc
     if (-not $stopped) {
@@ -928,7 +1110,11 @@ function Invoke-Watchdog {
         $confPath0 = Join-Path $BASE 'Mosaic.conf'
         if (Test-Path -LiteralPath $confPath0) {
             $pre = Read-MosaicConf $confPath0
-            if ($pre.PortAudio -ge 1024 -and $pre.PortAudio -le 65519) { $script:PORT_AUDIO = [int]$pre.PortAudio }
+            if ($pre.PortAudio -ge 1024 -and $pre.PortAudio -le 65504) { $script:PORT_AUDIO = [int]$pre.PortAudio }
+            if ($pre.PortWall -ge $script:PORT_AUDIO -and $pre.PortWall -le ($script:PORT_AUDIO + 31)) {
+                Write-Log ('ОСТАНОВ: port_wall={0} попадает в диапазон звука и локальных копий {1}…{2} — запуск отменён' -f $pre.PortWall, $script:PORT_AUDIO, ($script:PORT_AUDIO + 31))
+                return 1
+            }
             $pp = $pre.Layout -split 'x'
             $max0 = [math]::Min([int]$pp[0] * [int]$pp[1], 16)
             Initialize-RelayUrls @($pre.Cams | Select-Object -First $max0)
@@ -1004,17 +1190,48 @@ function Invoke-Watchdog {
         # локальные копии потоков: камера читается один раз, поэтому обрыв копии
         # останавливает и картинку, и звук — перезапускаем её сами
         if ($script:RELAY) {
+            $nowR = Get-NowSeconds
             foreach ($c in $channels) {
+                if ($script:RELAY_DEAD.ContainsKey($c.Name)) { continue }
+                if ($script:RELAY_ADOPTED.ContainsKey($c.Name)) { continue }
+
                 $rp = $script:RELAY_PROC[$c.Name]
-                if ($rp -and -not $rp.HasExited) {
-                    $script:RELAY_FAILS[$c.Name] = 0
+                $alive = $rp -and -not $rp.HasExited
+
+                if ($alive) {
+                    # «процесс жив» — не доказательство: подтверждаем полезный поток и
+                    # сбрасываем счётчик неудач только после устойчивой работы
+                    $port = 0
+                    if ($script:RELAY_PORT.ContainsKey($c.Name)) { $port = [int]$script:RELAY_PORT[$c.Name] }
+                    $confirmed = $script:RELAY_OK.ContainsKey($c.Name)
+                    if (-not $confirmed) {
+                        if (Test-RelayData $port 1500) {
+                            $script:RELAY_OK[$c.Name] = $nowR
+                            $script:RELAY_FAILS[$c.Name] = 0
+                            Write-Log ('{0}: локальная копия отдаёт поток (порт {1})' -f $c.Name, $port)
+                        }
+                    } elseif (($nowR - [double]$script:RELAY_OK[$c.Name]) -ge $RELAY_STABLE_SECONDS) {
+                        $script:RELAY_FAILS[$c.Name] = 0
+                    }
                     continue
                 }
+
+                # процесс пропал: счётчик не сбрасываем, перезапуск — с задержкой
+                $script:RELAY_OK.Remove($c.Name)
                 $f = 1
                 if ($script:RELAY_FAILS.ContainsKey($c.Name)) { $f = [int]$script:RELAY_FAILS[$c.Name] + 1 }
                 $script:RELAY_FAILS[$c.Name] = $f
-                if ($f -gt 5) { continue }
-                Write-Log ('{0}: локальная копия остановилась — перезапускаю (попытка {1} из 5)' -f $c.Name, $f)
+                if ($f -gt $RELAY_MAX_FAILS) {
+                    $script:RELAY_DEAD[$c.Name] = $true
+                    Write-Log ('{0}: локальная копия не восстанавливается после {1} попыток — нужен перезапуск стены' -f $c.Name, $RELAY_MAX_FAILS)
+                    continue
+                }
+                $next = 0.0
+                if ($script:RELAY_NEXT.ContainsKey($c.Name)) { $next = [double]$script:RELAY_NEXT[$c.Name] }
+                if ($nowR -lt $next) { continue }
+                $delay = $RELAY_BACKOFF[[Math]::Min($f - 1, $RELAY_BACKOFF.Count - 1)]
+                $script:RELAY_NEXT[$c.Name] = $nowR + $delay
+                Write-Log ('{0}: локальная копия остановилась — перезапускаю (попытка {1} из {2}, следующая не раньше {3} с)' -f $c.Name, $f, $RELAY_MAX_FAILS, $delay)
                 [void](Start-RelayProc $c)
                 [void](Start-SleepChecked 1)
             }
@@ -1311,6 +1528,18 @@ try {
     Write-Log ('аварийное завершение: {0}' -f $_.Exception.Message)
     $code = 1
 } finally {
+    # коллекторы гасим на любом пути выхода: ошибка старта стены, отказ HTTP/VLM,
+    # неверная конфигурация, исключение, обычный stop.flag
+    try {
+        if ($script:RELAY_PROC.Count -gt 0) {
+            $left = Stop-AllRelays
+            if ($left -eq 0) {
+                Remove-Item -LiteralPath $script:RELAY_PORTS_FILE -Force -ErrorAction SilentlyContinue
+            } else {
+                Write-Log ('ВНИМАНИЕ: при выходе не остановлено локальных копий: {0}' -f $left)
+            }
+        }
+    } catch { }
     try { $lock.Stop() } catch { }
     Remove-Item -LiteralPath $HEARTBEAT_FILE -Force -ErrorAction SilentlyContinue
     Remove-WallStatus
